@@ -1,10 +1,7 @@
 import type { NextConfig } from "next";
+import { frameAncestors } from "./lib/allowed-origins";
 
-const FRAME_ANCESTORS = [
-  "https://machcomputing.com",
-  "https://*.machcomputing.com",
-  "http://localhost:*",
-].join(" ");
+const FRAME_ANCESTORS = frameAncestors();
 
 const nextConfig: NextConfig = {
   async headers() {
@@ -17,6 +14,10 @@ const nextConfig: NextConfig = {
             value: `frame-ancestors ${FRAME_ANCESTORS}`,
           },
         ],
+      },
+      {
+        source: "/client.js",
+        headers: [{ key: "Access-Control-Allow-Origin", value: "*" }],
       },
     ];
   },

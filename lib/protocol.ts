@@ -6,6 +6,7 @@ import {
   type CompletionRequest,
 } from "./completions";
 import { CFG } from "./webgpu-llm/config.js";
+import { originAllowed } from "./allowed-origins";
 
 export const NS = "mach-llm";
 export const PROTOCOL_VERSION = 1;
@@ -15,23 +16,6 @@ interface RequestMessage {
   id: string;
   method: string;
   params?: unknown;
-}
-
-function originAllowed(origin: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(origin);
-  } catch {
-    return false;
-  }
-  if (url.hostname === "localhost") {
-    return url.protocol === "http:" || url.protocol === "https:";
-  }
-  if (url.protocol !== "https:") return false;
-  return (
-    url.hostname === "machcomputing.com" ||
-    url.hostname.endsWith(".machcomputing.com")
-  );
 }
 
 function isRequest(data: unknown): data is RequestMessage {
@@ -71,6 +55,11 @@ export function attachProtocol(win: Window): () => void {
         }
         case "load": {
           await engine.ensureLoaded((params ?? {}) as LoadOptions, progressChunk);
+          reply("result", await engine.status());
+          break;
+        }
+        case "settings.update": {
+          engine.updateRuntime((params ?? {}) as { batchSize?: number; mtp?: boolean });
           reply("result", await engine.status());
           break;
         }
@@ -142,11 +131,13 @@ export function attachProtocol(win: Window): () => void {
                     role: "assistant",
                     content: result.content,
                     reasoning_content: result.reasoning_content,
+                    ...(result.tool_calls ? { tool_calls: result.tool_calls } : {}),
                   },
                   finish_reason: result.finish_reason,
                 },
               ],
               usage: result.usage,
+              context: result.context,
             });
           } finally {
             busy = false;

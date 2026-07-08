@@ -59,7 +59,7 @@ class Engine {
   private mtpEnabled = false;
 
   generating = false;
-  committedSigs: string[] | null = null;
+  committed: { sigs: string[]; toolCallCount: number; closePending: boolean } | null = null;
 
   get ready() {
     return !!this.modelInstance && !!this.tokInstance;
@@ -136,7 +136,7 @@ class Engine {
     this.gpu?.destroy();
     this.gpu = null;
     this.deviceInfo = null;
-    this.committedSigs = null;
+    this.committed = null;
 
     onProgress({ stage: "tokenizer", message: "Loading tokenizer…", progress: null });
     const tok = await Tokenizer.load((message: string) =>
@@ -184,6 +184,15 @@ class Engine {
       vramBytes: vram,
     };
     onProgress({ stage: "ready", message: "Model ready.", progress: 1 });
+  }
+
+  updateRuntime(options: { batchSize?: number; mtp?: boolean }): void {
+    if (options.mtp !== undefined) this.mtpEnabled = !!options.mtp;
+    if (!this.modelInstance) return;
+    if (options.batchSize !== undefined) {
+      this.modelInstance.BATCH = Math.round(clamp(options.batchSize, 1, 8));
+    }
+    this.modelInstance.spec = !!this.modelInstance.hasMtp && this.mtpEnabled;
   }
 
   async wipeCache(): Promise<void> {

@@ -49,9 +49,15 @@ export function buildUserTurnSuffix(userText: string, thinking: boolean): string
   );
 }
 
-export function buildToolResponseSuffix(resultText: string, thinking: boolean): string {
+// Deliberately does NOT include the leading `</tool_call>`: whether the close
+// tag is already in GPU state depends on how the turn ended (fed via lookahead
+// in parallel mode, frozen out as a stop token in single-call mode), so the
+// caller prepends it only when it is still pending.
+export function buildToolResponsesSuffix(resultTexts: string[], thinking: boolean): string {
   return (
-    `</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n${resultText}\n</tool_response><|im_end|>\n<|im_start|>assistant\n` +
+    `<|im_end|>\n<|im_start|>user\n` +
+    resultTexts.map((t) => `<tool_response>\n${t}\n</tool_response>`).join("\n") +
+    `<|im_end|>\n<|im_start|>assistant\n` +
     (thinking ? "<think>\n" : "<think>\n\n</think>\n\n")
   );
 }

@@ -101,6 +101,10 @@ export class MachLLM {
     return this.#request("load", options);
   }
 
+  updateSettings(options) {
+    return this.#request("settings.update", options);
+  }
+
   wipeCache() {
     return this.#request("cache.wipe");
   }
