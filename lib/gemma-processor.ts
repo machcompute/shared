@@ -10,8 +10,6 @@ import {
 } from "./webgpu-llm/gemma-media";
 import { multimodalPlaceholder, type GemmaMediaType } from "./webgpu-llm/gemma-template";
 
-const HIDDEN = 2560;
-
 export interface PreparedGemmaPrompt {
   tokenIds: number[];
   /** Absolute decoder positions whose regular embedding is replaced by media. */
@@ -42,11 +40,14 @@ function toolResponseText(name: string, content: string, sanitize: (text: string
   return formatToolResponse(name, sanitize(content));
 }
 
-function rowsOf(values: Float32Array, label: string): number {
-  if (!values.length || values.length % HIDDEN) {
-    throw new Error(`Gemma ${label} encoder returned an invalid soft-embedding matrix.`);
+function rowsOf(values: Float32Array, width: number, label: string): number {
+  if (!Number.isInteger(width) || width < 1 || !values.length || values.length % width) {
+    throw new Error(
+      `Gemma ${label} encoder returned an invalid soft-embedding matrix ` +
+      `(${values.length} values for width ${width}).`
+    );
   }
-  return values.length / HIDDEN;
+  return values.length / width;
 }
 
 async function mediaEmbeddings(
@@ -75,9 +76,9 @@ async function mediaEmbeddings(
 
 /**
  * Preprocess mixed OpenAI-style content, encode each modality, and construct
- * the exact Gemma turn protocol plus embedding overrides.  Boundary tokens
- * remain in the language sequence; only repeated media placeholder IDs are
- * replaced with their 2560-wide tower projections.
+ * the exact Gemma turn protocol plus embedding overrides. Boundary tokens
+ * remain in the language sequence; repeated media placeholder IDs are
+ * replaced with projections matching the loaded text decoder's width.
  */
 export async function prepareGemmaPrompt(
   messages: ChatMessage[],
@@ -97,16 +98,20 @@ export async function prepareGemmaPrompt(
   const tokens: number[] = [];
   const overrides = new Map<number, Float32Array>();
   let mediaTokenCount = 0;
+  const embeddingWidth = model.embeddingWidth;
 
   const appendText = (text: string) => tokens.push(...tokenizer.encode(text));
   const appendMedia = (type: GemmaMediaType, values: Float32Array) => {
-    const rows = rowsOf(values, type);
+    const rows = rowsOf(values, embeddingWidth, type);
     const placeholderId = type === "image" ? tokenizer.image : type === "audio" ? tokenizer.audio : tokenizer.video;
     const ids = tokenizer.encode(multimodalPlaceholder(type, rows));
     let row = 0;
     for (const id of ids) {
       if (id === placeholderId) {
-        overrides.set(tokens.length, values.subarray(row * HIDDEN, (row + 1) * HIDDEN));
+        overrides.set(
+          tokens.length,
+          values.subarray(row * embeddingWidth, (row + 1) * embeddingWidth)
+        );
         tokens.push(tokenizer.pad);
         row++;
       } else {

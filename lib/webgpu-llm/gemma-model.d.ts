@@ -31,6 +31,8 @@ export declare class GemmaModel {
   constructor(gpu: GPU, weights: GemmaWeightsMap, opts?: { maxCtx?: number; chunk?: number; config?: GemmaConfig });
   pos: number;
   maxCtx: number;
+  /** Width of text and projected media embeddings for the loaded checkpoint. */
+  embeddingWidth: number;
   BATCH: number;
   hasMtp: false;
   spec: false;
