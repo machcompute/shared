@@ -2,7 +2,7 @@
  * Shared tool-call constraint contract.  It deliberately operates on token
  * IDs, leaving each model's prompt grammar/parser as a small adapter.
  */
-import { parseToolArguments } from "./gemma-tool-format";
+import { parseToolArguments, parseToolValue } from "./gemma-tool-format";
 
 export type JsonSchema = Record<string, unknown>;
 
@@ -10,6 +10,9 @@ export interface ConstraintTokenizer {
   encode(text: string): number[];
   vocabSize(): number;
   specialTokenId(text: string): number | undefined;
+  /** Plain text of a regular (non-special) token; used to classify numeric
+   * tokens. Optional: without it, numbers are steered digit-by-digit. */
+  tokenText?(id: number): string | undefined;
 }
 
 export interface ConstraintTool {
@@ -176,13 +179,65 @@ export class ToolConstraint {
   }
 
   private readonly tokenizer: ConstraintTokenizer;
+  private unrestrictedCache?: Uint32Array;
+  private gemmaIds?: GemmaTokenIds;
 
   private unrestricted(): Uint32Array {
-    return Uint32Array.from(
-      Array.from(this.all).filter(
-        (id) => id !== this.closeId && !this.forbiddenIds.has(id)
-      )
-    );
+    if (!this.unrestrictedCache) {
+      this.unrestrictedCache = Uint32Array.from(
+        Array.from(this.all).filter(
+          (id) => id !== this.closeId && !this.forbiddenIds.has(id)
+        )
+      );
+    }
+    return this.unrestrictedCache;
+  }
+
+  private unrestrictedWithout(excluded: number | undefined): Uint32Array {
+    if (excluded === undefined) return this.unrestricted();
+    return Uint32Array.from(Array.from(this.unrestricted()).filter((id) => id !== excluded));
+  }
+
+  /** First token of each literal continuation, the same steering primitive
+   * requirePrefix uses: a BPE first token is always a prefix of its target. */
+  private firstTokens(texts: string[]): number[] {
+    const ids = new Set<number>();
+    for (const text of texts) {
+      if (!text) continue;
+      const token = this.tokenizer.encode(text)[0];
+      if (token !== undefined && !this.forbiddenIds.has(token)) ids.add(token);
+    }
+    return [...ids];
+  }
+
+  private gemmaTokenIds(): GemmaTokenIds {
+    if (this.gemmaIds) return this.gemmaIds;
+    const single = (text: string): number | undefined => this.tokenizer.encode(text)[0];
+    const number = new Set<number>();
+    const textOf = this.tokenizer.tokenText?.bind(this.tokenizer);
+    if (textOf) {
+      const size = this.tokenizer.vocabSize();
+      for (let id = 0; id < size; id++) {
+        if (id === this.closeId || this.forbiddenIds.has(id)) continue;
+        const text = textOf(id);
+        if (text && /^[0-9eE+.\-]+$/.test(text)) number.add(id);
+      }
+    }
+    // Digit-by-digit fallback keeps numbers writable without tokenText.
+    for (const ch of ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '.', 'e', 'E', '+']) {
+      const id = single(ch);
+      if (id !== undefined && !this.forbiddenIds.has(id)) number.add(id);
+    }
+    this.gemmaIds = {
+      quote: this.tokenizer.specialTokenId(GEMMA_QUOTE) ?? single(GEMMA_QUOTE),
+      openBrace: single('{'),
+      closeBrace: single('}'),
+      openBracket: single('['),
+      closeBracket: single(']'),
+      comma: single(','),
+      number: Uint32Array.from([...number].sort((a, b) => a - b)),
+    };
+    return this.gemmaIds;
   }
 
   private requirePrefix(emitted: string, targets: string[]): Uint32Array | null {
@@ -258,6 +313,17 @@ export class ToolConstraint {
     }
   }
 
+  /**
+   * Incremental Gemma grammar walk.  `gemmaScan` re-derives the parse state
+   * of the emitted body (nested objects, arrays, strings, bare scalars) and
+   * this maps that state to the admissible next tokens: declared keys at
+   * every depth, kind-correct value openers, enum-steered string content, and
+   * delimiters gated on scalar validity and required/min-max completeness.
+   * A structurally complete body admits only the native close token — or
+   * nothing at all if it somehow fails the final schema check, which the
+   * decode loop surfaces as a schema error instead of decoding on with no
+   * way to ever close the call.
+   */
   private gemmaAllowed(raw: string): Uint32Array {
     const emitted = raw.trimStart();
     const targets = [...this.tools.keys()].map((name) => `call:${name}{`);
@@ -266,22 +332,119 @@ export class ToolConstraint {
 
     const schema = this.tools.get(match[1]);
     if (!schema) return new Uint32Array();
-    const properties = (schema.properties ?? {}) as JsonSchema;
-    const required = new Set(Array.isArray(schema.required) ? schema.required as string[] : []);
     const objectStart = emitted.indexOf("{", match.index + match[0].length - 1);
-    const keyState = gemmaTopLevelKeyState(emitted.slice(objectStart), new Set(Object.keys(properties)));
-    if (keyState.invalid) return new Uint32Array();
-    if (keyState.prefix !== null) {
-      const targets = [...keyState.remaining].map((key) => `${key}:`);
-      if ([...required].every((key) => keyState.seen.has(key))) targets.push("}");
-      return this.requirePrefix(keyState.prefix, targets) ?? this.unrestricted();
-    }
+    const state = gemmaScan(emitted.slice(objectStart), schema);
 
-    const parsed = parseGemmaArguments(emitted);
-    if (this.isGemmaStructurallyComplete(emitted) && typeMatches(parsed, schema)) {
-      return this.closeId === undefined ? new Uint32Array() : Uint32Array.of(this.closeId);
+    switch (state.kind) {
+      case "invalid":
+        return new Uint32Array();
+      case "complete": {
+        if (!typeMatches(parseGemmaArguments(emitted), schema)) return new Uint32Array();
+        return this.closeId === undefined ? new Uint32Array() : Uint32Array.of(this.closeId);
+      }
+      case "free":
+        return this.unrestricted();
+      case "key": {
+        const remaining = [...state.frame.declared].filter((key) => !state.frame.seen.has(key));
+        const keyTargets = remaining.map((key) => `${key}:`);
+        const partial = state.frame.keyBuf.trim();
+        if (!partial && [...state.frame.required].every((key) => state.frame.seen.has(key))) {
+          keyTargets.push("}");
+        }
+        return this.requirePrefix(partial, keyTargets) ?? this.unrestricted();
+      }
+      case "valueStart":
+        return this.gemmaValueStart(state.schema, state.frame);
+      case "inString":
+        return this.gemmaInString(state.schema, state.content);
+      case "inNumber": {
+        // A runaway numeral can never become schema-valid; 30 characters
+        // exceeds every finite JSON number a model should emit.
+        if (state.text.length > 30) return new Uint32Array();
+        const ids = new Set<number>(this.gemmaTokenIds().number);
+        const value = Number(state.text);
+        if (state.text !== "" && Number.isFinite(value) && typeMatches(value, state.schema)) {
+          for (const id of this.gemmaDelimiters(state.frame, true)) ids.add(id);
+        }
+        return sortedIds(ids);
+      }
+      case "inWord": {
+        const words = gemmaWordTargets(state.schema);
+        const matching = words.filter((word) => word.startsWith(state.text));
+        if (!matching.length) return new Uint32Array();
+        const ids = new Set<number>(this.firstTokens(
+          matching.filter((word) => word !== state.text).map((word) => word.slice(state.text.length))
+        ));
+        if (matching.includes(state.text) && typeMatches(parseToolValue(state.text), state.schema)) {
+          for (const id of this.gemmaDelimiters(state.frame, true)) ids.add(id);
+        }
+        return sortedIds(ids);
+      }
+      case "afterValue":
+        return sortedIds(this.gemmaDelimiters(state.frame, false));
     }
+  }
+
+  /** Admissible openers for a value of `schema` (or a whole free span). */
+  private gemmaValueStart(schema: unknown, frame: GemmaFrame | undefined): Uint32Array {
+    const info = gemmaSchemaKinds(schema);
+    if (info.free) return this.unrestricted();
+    const T = this.gemmaTokenIds();
+    const ids = new Set<number>();
+    if (info.kinds.has("string") && T.quote !== undefined) ids.add(T.quote);
+    if (info.kinds.has("number") || info.kinds.has("integer")) for (const id of T.number) ids.add(id);
+    for (const id of this.firstTokens(gemmaWordTargets(schema))) ids.add(id);
+    if (info.kinds.has("object") && T.openBrace !== undefined) ids.add(T.openBrace);
+    if (info.kinds.has("array") && T.openBracket !== undefined) ids.add(T.openBracket);
+    if (frame?.type === "arr" && frame.count === 0
+        && (numberKeyword(frame.schema, "minItems") ?? 0) === 0
+        && T.closeBracket !== undefined) {
+      ids.add(T.closeBracket);
+    }
+    return sortedIds(ids);
+  }
+
+  private gemmaInString(schema: unknown, content: string): Uint32Array {
+    const s = (schema && typeof schema === "object" && !Array.isArray(schema) ? schema : {}) as JsonSchema;
+    const T = this.gemmaTokenIds();
+    const members = Array.isArray(s.enum)
+      ? s.enum.filter((member): member is string => typeof member === "string")
+      : null;
+    if (members?.length) {
+      const matching = members.filter((member) => member.startsWith(content));
+      if (!matching.length) return new Uint32Array();
+      const ids = new Set<number>(this.firstTokens(
+        matching.filter((member) => member !== content).map((member) => member.slice(content.length))
+      ));
+      if (matching.includes(content) && T.quote !== undefined) ids.add(T.quote);
+      return sortedIds(ids);
+    }
+    const length = [...content].length;
+    const maxLength = numberKeyword(s, "maxLength");
+    if (maxLength !== undefined && length >= maxLength) {
+      return T.quote === undefined ? new Uint32Array() : Uint32Array.of(T.quote);
+    }
+    const minLength = numberKeyword(s, "minLength");
+    if (minLength !== undefined && length < minLength) return this.unrestrictedWithout(T.quote);
     return this.unrestricted();
+  }
+
+  /** `,` / `}` / `]` for the enclosing frame; `pendingValue` counts an
+   * in-progress scalar as one more completed entry. */
+  private gemmaDelimiters(frame: GemmaFrame | undefined, pendingValue: boolean): number[] {
+    if (!frame) return [];
+    const T = this.gemmaTokenIds();
+    const ids: number[] = [];
+    if (frame.type === "obj") {
+      if ([...frame.declared].some((key) => !frame.seen.has(key)) && T.comma !== undefined) ids.push(T.comma);
+      if ([...frame.required].every((key) => frame.seen.has(key)) && T.closeBrace !== undefined) ids.push(T.closeBrace);
+    } else if (frame.type === "arr") {
+      const count = frame.count + (pendingValue ? 1 : 0);
+      const maxItems = numberKeyword(frame.schema, "maxItems");
+      if ((maxItems === undefined || count < maxItems) && T.comma !== undefined) ids.push(T.comma);
+      if (count >= (numberKeyword(frame.schema, "minItems") ?? 0) && T.closeBracket !== undefined) ids.push(T.closeBracket);
+    }
+    return ids;
   }
 
   allowed(raw: string, parseArguments: (raw: string) => { name: string; arguments: Record<string, unknown> }): Uint32Array {
@@ -290,19 +453,6 @@ export class ToolConstraint {
     // grammar-specific so Qwen and Gemma cannot accidentally share syntax.
     void parseArguments;
     return this.grammar === "qwen" ? this.qwenAllowed(raw) : this.gemmaAllowed(raw);
-  }
-
-  private isGemmaStructurallyComplete(raw: string): boolean {
-    let depth = 0;
-    let quotes = 0;
-    for (let i = 0; i < raw.length; i++) {
-      if (raw.startsWith('<|"|>', i)) { quotes++; i += 4; continue; }
-      if (quotes % 2) continue;
-      if (raw[i] === '{') depth++;
-      if (raw[i] === '}') depth--;
-      if (depth < 0) return false;
-    }
-    return depth === 0 && quotes % 2 === 0 && raw.includes('{');
   }
 }
 
@@ -323,68 +473,396 @@ function parseGemmaArguments(raw: string): Record<string, unknown> {
   return start < 0 ? {} : parseToolArguments(raw.slice(start));
 }
 
-interface GemmaKeyState {
-  invalid: boolean;
-  prefix: string | null;
-  seen: Set<string>;
-  remaining: Set<string>;
+// ---------------------------------------------------------------------------
+// Incremental Gemma grammar scanner.
+//
+// Gemma's native tool syntax is `call:name{key:value,...}` with unquoted
+// keys, `<|"|>`-delimited strings, bare numbers/booleans, and nested
+// objects/arrays.  `gemmaScan` replays the emitted body against the tool's
+// JSON Schema and reports the exact parse state at the end of input, so the
+// constraint can steer the next token instead of discovering violations only
+// when the body closes.  Subschemas the walker cannot steer (compositions,
+// additionalProperties, unknown kinds) become validated free spans.
+
+const GEMMA_QUOTE = '<|"|>';
+
+interface GemmaTokenIds {
+  quote?: number;
+  openBrace?: number;
+  closeBrace?: number;
+  openBracket?: number;
+  closeBracket?: number;
+  comma?: number;
+  number: Uint32Array;
 }
 
-/** Tracks top-level Gemma argument keys while leaving nested value syntax to
- * the shared schema validator. Keys are emitted unquoted by Gemma's native
- * tool grammar, so rejecting an unknown prefix prevents it before dispatch. */
-function gemmaTopLevelKeyState(body: string, declared: Set<string>): GemmaKeyState {
-  const seen = new Set<string>();
-  const remaining = () => new Set([...declared].filter((key) => !seen.has(key)));
-  let i = 1;
-  let expectingKey = true;
-  let braces = 1;
-  let brackets = 0;
-  let quoted = false;
+interface GemmaObjFrame {
+  type: "obj";
+  props: JsonSchema;
+  declared: Set<string>;
+  required: Set<string>;
+  seen: Set<string>;
+  phase: "key" | "value" | "after";
+  keyBuf: string;
+  valueSchema: unknown;
+}
+
+interface GemmaArrFrame {
+  type: "arr";
+  schema: JsonSchema;
+  count: number;
+  phase: "value" | "after";
+}
+
+interface GemmaFreeFrame {
+  type: "free";
+  schema: unknown;
+  root: boolean;
+  start: number;
+  depth: number;
+  quoted: boolean;
+}
+
+type GemmaFrame = GemmaObjFrame | GemmaArrFrame | GemmaFreeFrame;
+
+type GemmaScanState =
+  | { kind: "invalid" }
+  | { kind: "complete" }
+  | { kind: "free" }
+  | { kind: "key"; frame: GemmaObjFrame }
+  | { kind: "valueStart"; schema: unknown; frame: GemmaFrame | undefined }
+  | { kind: "inString"; schema: unknown; content: string }
+  | { kind: "inNumber"; schema: unknown; text: string; frame: GemmaFrame | undefined }
+  | { kind: "inWord"; schema: unknown; text: string; frame: GemmaFrame | undefined }
+  | { kind: "afterValue"; frame: GemmaFrame };
+
+const sortedIds = (ids: Iterable<number>) => Uint32Array.from([...ids].sort((a, b) => a - b));
+
+/** Which Gemma value kinds a subschema admits; `free` marks spans the
+ * scanner validates as a whole instead of steering token-by-token. */
+function gemmaSchemaKinds(schema: unknown): { free: boolean; kinds: Set<string> } {
+  const free = { free: true, kinds: new Set<string>() };
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return free;
+  const s = schema as JsonSchema;
+  if (s.anyOf !== undefined || s.oneOf !== undefined || s.allOf !== undefined) return free;
+  const kinds = new Set<string>();
+  const declared = (Array.isArray(s.type) ? s.type : s.type !== undefined ? [s.type] : [])
+    .filter((t): t is string => typeof t === "string");
+  for (const t of declared) kinds.add(t);
+  if (Array.isArray(s.enum)) {
+    if (s.enum.some((member) => member !== null && typeof member === "object")) return free;
+    if (!declared.length) {
+      for (const member of s.enum) kinds.add(member === null ? "null" : typeof member);
+    }
+  } else if (!declared.length) {
+    if (s.properties !== undefined || s.required !== undefined
+        || s.additionalProperties !== undefined || s.propertyNames !== undefined) kinds.add("object");
+    else if (s.items !== undefined || s.prefixItems !== undefined
+        || s.minItems !== undefined || s.maxItems !== undefined) kinds.add("array");
+    else if (s.minLength !== undefined || s.maxLength !== undefined) kinds.add("string");
+    else if (s.minimum !== undefined || s.maximum !== undefined
+        || s.exclusiveMinimum !== undefined || s.exclusiveMaximum !== undefined) kinds.add("number");
+  }
+  if (s.nullable === true) kinds.add("null");
+  const known = new Set(["string", "number", "integer", "boolean", "null", "object", "array"]);
+  for (const kind of kinds) if (!known.has(kind)) return free;
+  return kinds.size ? { free: false, kinds } : free;
+}
+
+/** An object can be key-steered only when its keys are fully declared and
+ * its required set is satisfiable. */
+function gemmaObjectEnforceable(schema: unknown): boolean {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
+  const s = schema as JsonSchema;
+  if (s.additionalProperties !== undefined && s.additionalProperties !== false) return false;
+  if (s.propertyNames !== undefined) return false;
+  const props = s.properties;
+  if (!props || typeof props !== "object" || Array.isArray(props)) return false;
+  const declared = new Set(Object.keys(props as JsonSchema));
+  const required = Array.isArray(s.required) ? s.required : [];
+  return required.every((key) => typeof key === "string" && declared.has(key));
+}
+
+function gemmaWordTargets(schema: unknown): string[] {
+  const info = gemmaSchemaKinds(schema);
+  const words: string[] = [];
+  if (info.kinds.has("boolean")) words.push("true", "false");
+  if (info.kinds.has("null")) words.push("null");
+  return words;
+}
+
+function gemmaItemSchema(frame: GemmaArrFrame): unknown {
+  const prefixItems = Array.isArray(frame.schema.prefixItems) ? frame.schema.prefixItems : [];
+  if (frame.count < prefixItems.length) return prefixItems[frame.count];
+  return frame.schema.items;
+}
+
+type GemmaScalar = { sort: "string" | "number" | "word"; schema: unknown; buf: string };
+
+function gemmaScan(body: string, rootSchema: JsonSchema): GemmaScanState {
+  const frames: GemmaFrame[] = [];
+  // A property (not a plain let) so narrowing survives the closure writes in
+  // beginValue below.
+  const st: { scalar: GemmaScalar | null } = { scalar: null };
+  let complete = false;
+  let i = 0;
+  const invalid: GemmaScanState = { kind: "invalid" };
+
+  const finishValue = () => {
+    const parent = frames[frames.length - 1];
+    if (!parent) {
+      complete = true;
+      return;
+    }
+    if (parent.type === "obj") parent.phase = "after";
+    else if (parent.type === "arr") {
+      parent.count++;
+      parent.phase = "after";
+    }
+  };
+
+  // Begin the value whose first character sits at body[i].  Pushes a frame or
+  // opens a scalar; consumes only what it must (string quote markers, the
+  // composite openers).  False means the character cannot start any
+  // admissible kind.
+  const beginValue = (schema: unknown): boolean => {
+    const info = gemmaSchemaKinds(schema);
+    if (info.free) {
+      frames.push({ type: "free", schema, root: false, start: i, depth: 0, quoted: false });
+      return true;
+    }
+    if (body.startsWith(GEMMA_QUOTE, i)) {
+      if (!info.kinds.has("string")) return false;
+      st.scalar = { sort: "string", schema, buf: "" };
+      i += GEMMA_QUOTE.length;
+      return true;
+    }
+    const c = body[i];
+    if (c === "{") {
+      if (!info.kinds.has("object")) return false;
+      if (!gemmaObjectEnforceable(schema)) {
+        frames.push({ type: "free", schema, root: false, start: i, depth: 0, quoted: false });
+        return true;
+      }
+      const s = schema as JsonSchema;
+      const props = (s.properties ?? {}) as JsonSchema;
+      frames.push({
+        type: "obj",
+        props,
+        declared: new Set(Object.keys(props)),
+        required: new Set((Array.isArray(s.required) ? s.required : [])
+          .filter((key): key is string => typeof key === "string")),
+        seen: new Set(),
+        phase: "key",
+        keyBuf: "",
+        valueSchema: undefined,
+      });
+      i++;
+      return true;
+    }
+    if (c === "[") {
+      if (!info.kinds.has("array")) return false;
+      frames.push({ type: "arr", schema: schema as JsonSchema, count: 0, phase: "value" });
+      i++;
+      return true;
+    }
+    if (/[-0-9.]/.test(c)) {
+      if (!info.kinds.has("number") && !info.kinds.has("integer")) return false;
+      st.scalar = { sort: "number", schema, buf: "" };
+      return true;
+    }
+    if (/[a-z]/i.test(c)) {
+      if (!info.kinds.has("boolean") && !info.kinds.has("null")) return false;
+      st.scalar = { sort: "word", schema, buf: "" };
+      return true;
+    }
+    return false;
+  };
 
   while (i < body.length) {
-    if (body.startsWith('<|"|>', i)) {
-      quoted = !quoted;
-      i += 5;
-      continue;
-    }
-    if (quoted) { i++; continue; }
+    if (complete) return invalid;
 
-    if (expectingKey && braces === 1 && brackets === 0) {
-      while (i < body.length && /\s/.test(body[i])) i++;
-      if (i >= body.length) return { invalid: false, prefix: "", seen, remaining: remaining() };
-      if (body[i] === "}") return { invalid: false, prefix: null, seen, remaining: remaining() };
-      const start = i;
-      while (i < body.length && ![":", ",", "}"].includes(body[i])) i++;
-      const prefix = body.slice(start, i).trim();
-      if (i >= body.length) {
-        if (![...remaining()].some((key) => key.startsWith(prefix))) {
-          return { invalid: true, prefix: null, seen, remaining: remaining() };
+    if (st.scalar) {
+      if (st.scalar.sort === "string") {
+        if (body.startsWith(GEMMA_QUOTE, i)) {
+          if (!typeMatches(st.scalar.buf, st.scalar.schema)) return invalid;
+          i += GEMMA_QUOTE.length;
+          st.scalar = null;
+          finishValue();
+          continue;
         }
-        return { invalid: false, prefix, seen, remaining: remaining() };
+        st.scalar.buf += body[i];
+        i++;
+        continue;
       }
-      if (body[i] !== ":" || !declared.has(prefix) || seen.has(prefix)) {
-        return { invalid: true, prefix: null, seen, remaining: remaining() };
+      const c = body[i];
+      if (c === "," || c === "}" || c === "]") {
+        if (!typeMatches(parseToolValue(st.scalar.buf), st.scalar.schema)) return invalid;
+        st.scalar = null;
+        finishValue();
+        continue; // the delimiter belongs to the parent frame
       }
-      seen.add(prefix);
-      expectingKey = false;
+      if (body.startsWith(GEMMA_QUOTE, i)) return invalid;
+      st.scalar.buf += c;
       i++;
       continue;
     }
 
+    const top = frames[frames.length - 1];
+
+    if (top?.type === "free") {
+      if (body.startsWith(GEMMA_QUOTE, i)) {
+        top.quoted = !top.quoted;
+        i += GEMMA_QUOTE.length;
+        continue;
+      }
+      const c = body[i];
+      if (top.quoted) {
+        i++;
+        continue;
+      }
+      if (c === "{" || c === "[") {
+        top.depth++;
+        i++;
+        continue;
+      }
+      const closing = c === "}" || c === "]";
+      if (closing && (top.depth > 1 || (top.depth === 1 && !top.root))) {
+        top.depth--;
+        i++;
+        continue;
+      }
+      if (closing && top.depth === 1) {
+        // The free span is the whole root object; its close completes the call.
+        i++;
+        if (!typeMatches(parseToolValue(body.slice(top.start, i)), top.schema)) return invalid;
+        frames.pop();
+        complete = true;
+        continue;
+      }
+      if (!closing && (c !== "," || top.depth > 0)) {
+        i++;
+        continue;
+      }
+      // The span ends just before c; validate it and let the parent frame
+      // process the delimiter.
+      if (!typeMatches(parseToolValue(body.slice(top.start, i)), top.schema)) return invalid;
+      frames.pop();
+      finishValue();
+      continue;
+    }
+
     const c = body[i];
-    if (c === "{") braces++;
-    else if (c === "}") {
-      braces--;
-      if (braces === 0) return { invalid: false, prefix: null, seen, remaining: remaining() };
-    } else if (c === "[") brackets++;
-    else if (c === "]") brackets--;
-    else if (c === "," && braces === 1 && brackets === 0) expectingKey = true;
-    if (braces < 0 || brackets < 0) return { invalid: true, prefix: null, seen, remaining: remaining() };
-    i++;
+    if (!top) {
+      if (/\s/.test(c)) {
+        i++;
+        continue;
+      }
+      if (c !== "{") return invalid;
+      const before = frames.length;
+      if (!beginValue(rootSchema)) return invalid;
+      const pushed = frames[frames.length - 1];
+      if (frames.length > before && pushed.type === "free") pushed.root = true;
+      continue;
+    }
+
+    if (top.type === "obj") {
+      if (top.phase === "key") {
+        if (c === "}") {
+          if (top.keyBuf.trim()) return invalid;
+          if (![...top.required].every((key) => top.seen.has(key))) return invalid;
+          frames.pop();
+          finishValue();
+          i++;
+          continue;
+        }
+        if (c === ":") {
+          const key = top.keyBuf.trim();
+          if (!key || !top.declared.has(key) || top.seen.has(key)) return invalid;
+          top.seen.add(key);
+          top.valueSchema = top.props[key];
+          top.keyBuf = "";
+          top.phase = "value";
+          i++;
+          continue;
+        }
+        if (c === ",") return invalid;
+        top.keyBuf += c;
+        i++;
+        continue;
+      }
+      if (/\s/.test(c)) {
+        i++;
+        continue;
+      }
+      if (top.phase === "value") {
+        if (!beginValue(top.valueSchema)) return invalid;
+        continue;
+      }
+      if (c === ",") {
+        if (![...top.declared].some((key) => !top.seen.has(key))) return invalid;
+        top.phase = "key";
+        i++;
+        continue;
+      }
+      if (c === "}") {
+        if (![...top.required].every((key) => top.seen.has(key))) return invalid;
+        frames.pop();
+        finishValue();
+        i++;
+        continue;
+      }
+      return invalid;
+    }
+
+    // Array frame.
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    if (top.phase === "value") {
+      if (c === "]") {
+        if (top.count > 0) return invalid; // trailing comma
+        if ((numberKeyword(top.schema, "minItems") ?? 0) > 0) return invalid;
+        frames.pop();
+        finishValue();
+        i++;
+        continue;
+      }
+      if (!beginValue(gemmaItemSchema(top))) return invalid;
+      continue;
+    }
+    if (c === ",") {
+      const maxItems = numberKeyword(top.schema, "maxItems");
+      if (maxItems !== undefined && top.count >= maxItems) return invalid;
+      top.phase = "value";
+      i++;
+      continue;
+    }
+    if (c === "]") {
+      if (top.count < (numberKeyword(top.schema, "minItems") ?? 0)) return invalid;
+      frames.pop();
+      finishValue();
+      i++;
+      continue;
+    }
+    return invalid;
   }
 
-  return expectingKey
-    ? { invalid: false, prefix: "", seen, remaining: remaining() }
-    : { invalid: false, prefix: null, seen, remaining: remaining() };
+  if (complete) return { kind: "complete" };
+  const top = frames[frames.length - 1];
+  if (st.scalar) {
+    if (st.scalar.sort === "string") return { kind: "inString", schema: st.scalar.schema, content: st.scalar.buf };
+    if (st.scalar.sort === "number") return { kind: "inNumber", schema: st.scalar.schema, text: st.scalar.buf, frame: top };
+    return { kind: "inWord", schema: st.scalar.schema, text: st.scalar.buf, frame: top };
+  }
+  if (!top) return invalid;
+  if (top.type === "free") return { kind: "free" };
+  if (top.type === "obj") {
+    if (top.phase === "key") return { kind: "key", frame: top };
+    if (top.phase === "value") return { kind: "valueStart", schema: top.valueSchema, frame: top };
+    return { kind: "afterValue", frame: top };
+  }
+  if (top.phase === "value") return { kind: "valueStart", schema: gemmaItemSchema(top), frame: top };
+  return { kind: "afterValue", frame: top };
 }

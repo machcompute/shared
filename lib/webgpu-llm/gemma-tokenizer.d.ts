@@ -17,4 +17,5 @@ export declare class GemmaTokenizer {
   makeDecoder(): (id: number) => string;
   vocabSize(): number;
   specialTokenId(text: string): number | undefined;
+  tokenText(id: number): string | undefined;
 }

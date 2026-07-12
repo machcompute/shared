@@ -203,10 +203,17 @@ export async function runGemmaCompletion(
   let stopped = stopIds.includes(next);
   if (!stopped) model.notePenaltyToken(next);
 
+  // True when `next` was already consumed by the mid-batch early exit below;
+  // consuming it again would feed the tool-call opener into the parser's body
+  // buffer and derail the schema constraint.
+  let nextConsumed = false;
   for (;;) {
     while (!signal.aborted && total < maxNew && !stopped && !toolParser.isComplete) {
-      consume(next);
-      total++;
+      if (!nextConsumed) {
+        consume(next);
+        total++;
+      }
+      nextConsumed = false;
       if (toolParser.isComplete) break;
       if (total >= maxNew || model.pos >= model.maxCtx - 1) break;
       const allowedTokenIds = constraint && toolParser.isOpen
@@ -233,6 +240,7 @@ export async function runGemmaCompletion(
           const unused = result.ids.length - i - 1;
           model.rewindDecode(unused);
           next = id;
+          nextConsumed = true;
           break;
         }
       }
@@ -253,6 +261,9 @@ export async function runGemmaCompletion(
 
     const cont = await model.decodeBatch(next, 1, { ...sampling, stopIds, eosId: tok.eos });
     next = cont.ids[0];
+    // `next` is a fresh token even if the loop above exited with a consumed
+    // pivot (a tool call completing mid-batch leaves nextConsumed set).
+    nextConsumed = false;
     stopped = cont.stopped || stopIds.includes(next);
     toolParser = new GemmaToolCallParser();
     toolIndex++;

@@ -129,6 +129,13 @@ export function formatToolResponse(name: string, content: string): string {
   return "<|tool_response>response:" + name + "{value:" + formatArgument(content, false) + "}<tool_response|>";
 }
 
+/** Parse one Gemma-format value (string/number/word/object/array) in
+ * isolation, as the incremental tool constraint needs for free-form spans. */
+export function parseToolValue(text: string): unknown {
+  const p = { s: text, i: 0 };
+  return parseValue(p);
+}
+
 export function parseToolArguments(body: string): Record<string, unknown> {
   const p = { s: body, i: 0 };
   skipWs(p);
