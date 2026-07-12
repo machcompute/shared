@@ -267,7 +267,7 @@ export async function runCompletion(
   const constraint = request.tools?.length
     ? new ToolConstraint(request.tools, tok, {
         closeToken: "</tool_call>",
-        namePrefix: "<function=",
+        grammar: "qwen",
         forbiddenTokenIds: [tok.eos],
       })
     : null;

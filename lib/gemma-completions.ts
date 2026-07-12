@@ -96,7 +96,7 @@ export async function runGemmaCompletion(
   const constraint = canTool
     ? new ToolConstraint(request.tools!, tok, {
         closeToken: "<tool_call|>",
-        namePrefix: "call:",
+        grammar: "gemma",
         forbiddenTokenIds: [tok.eos, tok.turnEnd],
       })
     : null;
