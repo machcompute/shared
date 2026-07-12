@@ -53,7 +53,7 @@ export function attachProtocol(win: Window): () => void {
           break;
         }
         case "models.list": {
-          reply("result", { object: "list", data: engine.listModels() });
+          reply("result", { object: "list", data: await engine.listModels() });
           break;
         }
         case "load": {

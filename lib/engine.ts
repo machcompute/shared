@@ -65,6 +65,7 @@ export interface EngineStatus {
 
 export interface ListedModel extends Pick<ModelProfile, "id" | "label" | "modalities" | "maxContext"> {
   object: "model";
+  cached: boolean | null;
 }
 
 const clamp = (value: number, min: number, max: number) =>
@@ -130,14 +131,17 @@ class Engine {
     return this.activeModel;
   }
 
-  listModels(): ListedModel[] {
-    return availableModels().map(({ id, label, modalities, maxContext }) => ({
-      id,
-      object: "model",
-      label,
-      modalities,
-      maxContext,
-    }));
+  async listModels(): Promise<ListedModel[]> {
+    return Promise.all(
+      availableModels().map(async ({ id, label, modalities, maxContext }) => ({
+        id,
+        object: "model" as const,
+        label,
+        modalities,
+        maxContext,
+        cached: await this.probeCache(id),
+      }))
+    );
   }
 
   get model(): RuntimeModel {
@@ -215,7 +219,14 @@ class Engine {
       model: this.activeModel,
       activeModel: this.activeModel,
       defaultModel: DEFAULT_MODEL_ID,
-      availableModels: this.listModels(),
+      // Status keeps its existing lightweight registry summary; callers that
+      // need per-model cache state use models.list().
+      availableModels: availableModels().map(({ id, label, modalities, maxContext }) => ({
+        id,
+        label,
+        modalities,
+        maxContext,
+      })),
       modalities: profile.modalities,
       webgpu,
       adapter,

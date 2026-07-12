@@ -47,7 +47,18 @@ That is the whole integration. `connect()` injects a hidden `<iframe allow="webg
 - `onProgress` — shorthand for `llm.on("progress", fn)`. Events: `{ stage, message, progress }` with stages `tokenizer`, `gpu`, `download`, `quantize`, `cache`, `pipelines`, `prefill`, `ready`.
 - `timeoutMs` — handshake timeout, default 20000.
 
-`llm.models.list()` → `{ object: "list", data: Model[] }` — lists every registered runtime before loading it. Each `Model` has `{ id, object: "model", label, modalities, maxContext }`.
+`llm.models.list()` → `{ object: "list", data: Model[] }` — lists every registered runtime before loading it and probes each model's cache independently. Each `Model` has `{ id, object: "model", label, modalities, maxContext, cached }`, where `cached` is:
+
+- `true` — a valid local weights cache exists for that model.
+- `false` — that model is not cached locally.
+- `null` — cache availability could not be determined, for example because browser storage is unavailable.
+
+```js
+const { data: models } = await llm.models.list();
+console.table(models.map(({ id, label, cached }) => ({ id, label, cached })));
+```
+
+The cache probe does not load a model or download weights.
 
 `llm.chat.completions.create(params, options?)`
 
@@ -64,7 +75,7 @@ That is the whole integration. `connect()` injects a hidden `<iframe allow="webg
 - `finish_reason` — `"stop"` (EOS), `"length"` (hit `max_tokens` or the context window), `"abort"`.
 - `usage.prompt_tokens` counts the tokens actually prefilled: on a continuation turn (see below) that is just the new suffix, not the whole conversation.
 
-`llm.status()` → `{ model, activeModel, defaultModel, availableModels, modalities, webgpu, adapter, cached, loaded, generating, hasMtp, contextUsedTokens, contextMaxTokens, device }` — `webgpu` says the API exists, `adapter` says a usable GPU adapter was actually found; gate any "Load model" UI on both.
+`llm.status()` → `{ model, activeModel, defaultModel, availableModels, modalities, webgpu, adapter, cached, loaded, generating, hasMtp, contextUsedTokens, contextMaxTokens, device }` — reports runtime state for the active model. In particular, `status.cached` applies only to `status.activeModel`; use `llm.models.list()` for per-model cache status. `webgpu` says the API exists, while `adapter` says a usable GPU adapter was actually found; gate any "Load model" UI on both.
 
 `llm.load(options?)` — optional explicit preload; `{ model?, maxContext?, batchSize?, mtp?, reload? }`. Loading Gemma uses `batchSize: 1` and a practical default 8k context; a larger context can be requested explicitly up to 131,072 tokens, subject to GPU memory.
 
@@ -106,4 +117,4 @@ Launch Chrome with Vulkan and Unsafe WebGPU enabled when your Linux setup needs 
 
 ## Protocol (for non-JS clients)
 
-Requests to the iframe: `{ ns: "mach-llm", id, method, params }` with methods `ping`, `status`, `models.list`, `load`, `chat.completions.create`, `abort` (`{ targetId }`), `settings.update`, `cache.wipe`. Replies: `{ ns, id, type: "chunk" | "result" | "error", data }`; `models.list` replies with `{ object: "list", data: Model[] }`; chunks are `{ event: "progress", progress }` or `{ event: "chunk", chunk }`. On boot the engine broadcasts `{ ns, type: "ready", version, model }` to its parent.
+Requests to the iframe: `{ ns: "mach-llm", id, method, params }` with methods `ping`, `status`, `models.list`, `load`, `chat.completions.create`, `abort` (`{ targetId }`), `settings.update`, `cache.wipe`. Replies: `{ ns, id, type: "chunk" | "result" | "error", data }`; `models.list` replies with `{ object: "list", data: Model[] }`, including the per-model `cached` value described above. Chunks are `{ event: "progress", progress }` or `{ event: "chunk", chunk }`. On boot the engine broadcasts `{ ns, type: "ready", version, model }` to its parent.
