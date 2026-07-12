@@ -40,6 +40,7 @@ export declare class GemmaModel {
   resetPenaltyWindow(): void;
   notePenaltyToken(id: number): void;
   recentSet(): Set<number>;
+  rewindDecode(count: number): void;
   prefill(
     tokenIds: number[] | Uint32Array,
     onProgress?: (done: number, total: number) => void,

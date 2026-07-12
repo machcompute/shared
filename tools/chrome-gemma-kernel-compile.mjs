@@ -29,9 +29,14 @@ const kernelSourceBase64 = Buffer.from(kernelSource).toString("base64");
 // materially different compiled paths (local versus global text attention).
 const cases = [
   { name: "gemvQ4", modality: "text", args: { N: 2560, K: 2560 } },
+  { name: "gemvQ4", label: "e2b-subgroups", modality: "text", args: { N: 1536, K: 1536, SUBGROUPS: 1 } },
+  { name: "gemvQ4", label: "e2b-gated", modality: "text", args: { N: 1536, K: 9216, SUBGROUPS: 1, GATED: 1 } },
   { name: "gemmQ4", modality: "text", args: { N: 2560, K: 2560 } },
+  { name: "gemmQ4", label: "e2b", modality: "text", args: { N: 12288, K: 1536 } },
   { name: "gatherQ4", modality: "text", args: { START: 0, NUM: 256, K: 2560, SCALE: Math.sqrt(2560) } },
   { name: "rmsnorm", modality: "text", args: { K: 2560 } },
+  { name: "rmsnormAdd", modality: "text", args: { K: 2560 } },
+  { name: "rmsnormAddScale", label: "e2b", modality: "text", args: { K: 1536 } },
   { name: "layernorm", modality: "audio", args: { K: 1024 } },
   { name: "clearF32", modality: "shared", args: null },
   { name: "add", modality: "shared", args: null },
@@ -49,6 +54,12 @@ const cases = [
     label: "sliding",
     modality: "text",
     args: { HEADS: 8, KV_HEADS: 2, HEAD_DIM: 256, ROTARY_PAIRS: 128, MAXCTX: 512 },
+  },
+  {
+    name: "textKvPrep",
+    label: "e2b-sliding",
+    modality: "text",
+    args: { HEADS: 8, KV_HEADS: 1, HEAD_DIM: 256, ROTARY_PAIRS: 128, MAXCTX: 512 },
   },
   {
     name: "textKvPrep",
@@ -76,9 +87,47 @@ const cases = [
   },
   {
     name: "textCausalAttention",
+    label: "e2b-sliding",
+    modality: "text",
+    args: { HEADS: 8, KV_HEADS: 1, HEAD_DIM: 256, MAXCTX: 512, WINDOW: 512, ATTENTION_SCALE: 1 },
+  },
+  {
+    name: "textCausalAttention",
     label: "global",
     modality: "text",
     args: { HEADS: 8, KV_HEADS: 2, HEAD_DIM: 512, MAXCTX: 512, WINDOW: 0, ATTENTION_SCALE: 1 },
+  },
+  {
+    name: "textFlashAttention",
+    label: "sliding",
+    modality: "text",
+    args: { HEADS: 8, KV_HEADS: 2, HEAD_DIM: 256, MAXCTX: 8192, WINDOW: 512, ATTENTION_SCALE: 1 },
+  },
+  {
+    // E2B's single KV head puts all eight Q heads in one group, compiling the
+    // two-batch (vec4 + vec4) head path.
+    name: "textFlashAttention",
+    label: "e2b-sliding",
+    modality: "text",
+    args: { HEADS: 8, KV_HEADS: 1, HEAD_DIM: 256, MAXCTX: 8192, WINDOW: 512, ATTENTION_SCALE: 1 },
+  },
+  {
+    name: "textFlashAttention",
+    label: "global",
+    modality: "text",
+    args: { HEADS: 8, KV_HEADS: 2, HEAD_DIM: 512, MAXCTX: 8192, WINDOW: 0, ATTENTION_SCALE: 1 },
+  },
+  {
+    name: "textFlashCombine",
+    label: "sliding",
+    modality: "text",
+    args: { HEADS: 8, HEAD_DIM: 256, MAXCTX: 8192, WINDOW: 512 },
+  },
+  {
+    name: "textFlashCombine",
+    label: "global",
+    modality: "text",
+    args: { HEADS: 8, HEAD_DIM: 512, MAXCTX: 8192, WINDOW: 0 },
   },
   { name: "headRmsnorm", modality: "vision", args: { HEADS: 12, HEAD_DIM: 64 } },
   { name: "vision2DRope", modality: "vision", args: { HEADS: 12, HEAD_DIM: 64, THETA: 100 } },
@@ -249,7 +298,8 @@ function browserExpression(sourceBase64, testCases) {
       if (!adapter) {
         return { webgpu, adapter: false, exported, missingCases, staleCases, cases: [] };
       }
-      const device = await adapter.requestDevice();
+      const requiredFeatures = adapter.features.has("subgroups") ? ["subgroups"] : [];
+      const device = await adapter.requestDevice({ requiredFeatures });
       const results = [];
       for (const testCase of cases) {
         const generator = kernels[testCase.name];

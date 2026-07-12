@@ -81,7 +81,11 @@ function resolveLoadOptions(options: LoadOptions, model: ModelId) {
     maxContext: Math.round(
       clamp(options.maxContext ?? (gemma ? 8192 : RT.maxCtx), 1024, profile.maxContext)
     ),
-    batchSize: Math.round(clamp(options.batchSize ?? (gemma ? 1 : 8), 1, gemma ? 1 : 8)),
+    // Long decode command buffers monopolize the same GPU queue Chrome uses
+    // for compositing. With the flash-decoding attention path a Gemma forward
+    // is short enough that four tokens amortize the per-batch readback while
+    // keeping each burst well under the old two-forward wall-clock.
+    batchSize: Math.round(clamp(options.batchSize ?? (gemma ? 4 : 8), 1, 8)),
     mtp: gemma ? false : options.mtp ?? false,
   };
 }
@@ -329,9 +333,7 @@ class Engine {
     if (options.mtp !== undefined) this.mtpEnabled = !!options.mtp;
     if (!this.modelInstance) return;
     if (options.batchSize !== undefined) {
-      this.modelInstance.BATCH = Math.round(
-        clamp(options.batchSize, 1, isGemmaModelId(this.activeModel) ? 1 : 8)
-      );
+      this.modelInstance.BATCH = Math.round(clamp(options.batchSize, 1, 8));
     }
     this.modelInstance.spec = !!this.modelInstance.hasMtp && this.mtpEnabled;
   }

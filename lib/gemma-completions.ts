@@ -213,9 +213,29 @@ export async function runGemmaCompletion(
         ? constraint.allowed(toolParser.rawBuffer, parseGemmaToolCallBody)
         : undefined;
       if (allowedTokenIds && !allowedTokenIds.length) throw new Error("Tool call cannot satisfy the declared schema.");
-      const result = await model.decodeBatch(next, 1, { ...sampling, stopIds, eosId: tok.eos, allowedTokenIds });
-      next = result.ids[0];
-      stopped = result.stopped || stopIds.includes(next);
+      const k = Math.min(
+        toolParser.isOpen ? 1 : model.BATCH,
+        maxNew - total,
+        model.maxCtx - model.pos,
+      );
+      const result = await model.decodeBatch(next, k, { ...sampling, stopIds, eosId: tok.eos, allowedTokenIds });
+      for (let i = 0; i < result.ids.length; i++) {
+        const id = result.ids[i];
+        const last = i === result.ids.length - 1;
+        if (last) {
+          next = id;
+          stopped = result.stopped || stopIds.includes(id);
+          break;
+        }
+        consume(id);
+        total++;
+        if (toolParser.isOpen || toolParser.isComplete || total >= maxNew) {
+          const unused = result.ids.length - i - 1;
+          model.rewindDecode(unused);
+          next = id;
+          break;
+        }
+      }
     }
 
     if (canTool && !toolParser.isComplete && toolParser.isOpen && next === toolCallClose) {
