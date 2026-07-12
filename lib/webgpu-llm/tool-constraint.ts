@@ -18,7 +18,12 @@ export interface ConstraintTool {
 
 export type ToolGrammar = "qwen" | "gemma";
 
-const SUPPORTED = new Set(["type", "properties", "required", "items", "enum", "nullable", "description"]);
+const SUPPORTED = new Set([
+  "$schema", "type", "properties", "required", "items", "enum", "nullable", "description",
+  "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+  "minItems", "maxItems", "anyOf", "oneOf", "allOf", "prefixItems",
+  "additionalProperties", "propertyNames",
+]);
 
 function checkSchema(schema: unknown, path = "parameters"): void {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
@@ -30,26 +35,114 @@ function checkSchema(schema: unknown, path = "parameters"): void {
     for (const [key, child] of Object.entries(record.properties as JsonSchema)) checkSchema(child, `${path}.properties.${key}`);
   }
   if (record.items) checkSchema(record.items, `${path}.items`);
+  if (Array.isArray(record.prefixItems)) {
+    record.prefixItems.forEach((child, index) => checkSchema(child, `${path}.prefixItems[${index}]`));
+  }
+  for (const keyword of ["anyOf", "oneOf", "allOf"] as const) {
+    if (record[keyword] !== undefined && !Array.isArray(record[keyword])) {
+      throw new Error(`${path}.${keyword} must be an array`);
+    }
+    (record[keyword] as unknown[] | undefined)?.forEach((child, index) =>
+      checkSchema(child, `${path}.${keyword}[${index}]`)
+    );
+  }
+  if (record.additionalProperties !== undefined) {
+    checkSchema(record.additionalProperties, `${path}.additionalProperties`);
+  }
+  if (record.propertyNames !== undefined) checkSchema(record.propertyNames, `${path}.propertyNames`);
 }
 
-function typeMatches(value: unknown, schema: JsonSchema): boolean {
+function numberKeyword(schema: JsonSchema, keyword: string): number | undefined {
+  const value = schema[keyword];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function typeMatches(value: unknown, inputSchema: unknown): boolean {
+  if (inputSchema === true || inputSchema === undefined) return true;
+  if (inputSchema === false || !inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return false;
+  const schema = inputSchema as JsonSchema;
+
+  if (value === null && schema.nullable === true) return true;
+  if (Array.isArray(schema.allOf) && !schema.allOf.every((child) => typeMatches(value, child))) return false;
+  if (Array.isArray(schema.anyOf) && !schema.anyOf.some((child) => typeMatches(value, child))) return false;
+  if (Array.isArray(schema.oneOf) && schema.oneOf.filter((child) => typeMatches(value, child)).length !== 1) return false;
   if (schema.enum && Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) return false;
-  const type = schema.type ?? (schema.properties ? "object" : undefined);
-  if (type === "string") return typeof value === "string";
-  if (type === "number") return typeof value === "number" && Number.isFinite(value);
-  if (type === "integer") return typeof value === "number" && Number.isInteger(value);
+
+  const declaredTypes = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (declaredTypes.length > 1) {
+    return declaredTypes.some((type) => typeMatches(value, { ...schema, type }));
+  }
+  const inferredType = schema.properties || schema.required || schema.additionalProperties !== undefined || schema.propertyNames
+    ? "object"
+    : schema.items !== undefined || schema.prefixItems || schema.minItems !== undefined || schema.maxItems !== undefined
+      ? "array"
+      : (schema.minLength !== undefined || schema.maxLength !== undefined) && typeof value === "string"
+        ? "string"
+        : (schema.minimum !== undefined || schema.maximum !== undefined || schema.exclusiveMinimum !== undefined || schema.exclusiveMaximum !== undefined)
+            && typeof value === "number"
+          ? "number"
+          : undefined;
+  const type = declaredTypes[0] ?? inferredType;
+
+  if (type === "string") {
+    if (typeof value !== "string") return false;
+    const length = [...value].length;
+    const minLength = numberKeyword(schema, "minLength");
+    const maxLength = numberKeyword(schema, "maxLength");
+    return (minLength === undefined || length >= minLength) && (maxLength === undefined || length <= maxLength);
+  }
+  if (type === "number" || type === "integer") {
+    if (typeof value !== "number" || !Number.isFinite(value) || (type === "integer" && !Number.isInteger(value))) return false;
+    const minimum = numberKeyword(schema, "minimum");
+    const maximum = numberKeyword(schema, "maximum");
+    const exclusiveMinimum = numberKeyword(schema, "exclusiveMinimum");
+    const exclusiveMaximum = numberKeyword(schema, "exclusiveMaximum");
+    return (minimum === undefined || value >= minimum)
+      && (maximum === undefined || value <= maximum)
+      && (exclusiveMinimum === undefined || value > exclusiveMinimum)
+      && (exclusiveMaximum === undefined || value < exclusiveMaximum);
+  }
   if (type === "boolean") return typeof value === "boolean";
   if (type === "null") return value === null;
-  if (type === "array") return Array.isArray(value) && (!schema.items || value.every((item) => typeMatches(item, schema.items as JsonSchema)));
+  if (type === "array") {
+    if (!Array.isArray(value)) return false;
+    const minItems = numberKeyword(schema, "minItems");
+    const maxItems = numberKeyword(schema, "maxItems");
+    if ((minItems !== undefined && value.length < minItems) || (maxItems !== undefined && value.length > maxItems)) return false;
+    const prefixItems = Array.isArray(schema.prefixItems) ? schema.prefixItems : [];
+    for (let index = 0; index < Math.min(value.length, prefixItems.length); index++) {
+      if (!typeMatches(value[index], prefixItems[index])) return false;
+    }
+    if (schema.items !== undefined) {
+      const start = prefixItems.length ? prefixItems.length : 0;
+      for (let index = start; index < value.length; index++) {
+        if (!typeMatches(value[index], schema.items)) return false;
+      }
+    }
+    return true;
+  }
   if (type === "object") {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const obj = value as JsonSchema;
     const props = (schema.properties ?? {}) as JsonSchema;
-    if (Object.keys(obj).some((key) => !(key in props))) return false;
-    if (Array.isArray(schema.required) && schema.required.some((key) => !(key in obj))) return false;
-    return Object.entries(obj).every(([key, item]) => typeMatches(item, props[key] as JsonSchema));
+    if (Array.isArray(schema.required) && schema.required.some((key) => typeof key === "string" && !(key in obj))) return false;
+    if (schema.propertyNames !== undefined && Object.keys(obj).some((key) => !typeMatches(key, schema.propertyNames))) return false;
+    for (const [key, item] of Object.entries(obj)) {
+      if (key in props) {
+        if (!typeMatches(item, props[key])) return false;
+        continue;
+      }
+      const additional = schema.additionalProperties;
+      // JSON Schema permits additional properties by default. Zod's closed
+      // objects transmit `additionalProperties: false`, while z.record()
+      // transmits a schema (often `{}`) for every undeclared value.
+      if (additional === false) return false;
+      if (additional !== undefined && additional !== true && !typeMatches(item, additional)) return false;
+    }
+    return true;
   }
-  // Omitted `type` is permitted by OpenAI-style schemas.
+  // Omitted `type` is permitted by JSON Schema; composition and enum checks
+  // above still apply.
   return true;
 }
 
