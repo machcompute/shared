@@ -2,7 +2,26 @@ import { GPU } from "./webgpu-llm/gpu.js";
 import { Loader } from "./webgpu-llm/loader.js";
 import { Model } from "./webgpu-llm/model.js";
 import { Tokenizer } from "./webgpu-llm/tokenizer.js";
-import { CFG, RT } from "./webgpu-llm/config.js";
+import { RT } from "./webgpu-llm/config.js";
+import { GemmaLoader } from "./webgpu-llm/gemma-loader.js";
+import { GemmaModel } from "./webgpu-llm/gemma-model.js";
+import { GemmaTokenizer } from "./webgpu-llm/gemma-tokenizer.js";
+import { GEMMA_E2B_CFG, GEMMA_E4B_CFG } from "./webgpu-llm/gemma-config.js";
+import type { GemmaWeightsMap } from "./webgpu-llm/gemma-loader.js";
+import type { WeightsMap } from "./webgpu-llm/loader.js";
+import {
+  DEFAULT_MODEL_ID,
+  GEMMA_E2B_MODEL_ID,
+  GEMMA_E4B_MODEL_ID,
+  QWEN_MODEL_ID,
+  assertModelRegistered,
+  availableModels,
+  getModelProfile,
+  isModelId,
+  isGemmaModelId,
+  type ModelId,
+  type ModelProfile,
+} from "./webgpu-llm/model-registry";
 
 export interface ProgressEvent {
   stage: string;
@@ -13,6 +32,8 @@ export interface ProgressEvent {
 export type OnProgress = (event: ProgressEvent) => void;
 
 export interface LoadOptions {
+  /** Select a registered model. Omit after load to keep using the active one. */
+  model?: ModelId;
   maxContext?: number;
   batchSize?: number;
   mtp?: boolean;
@@ -27,6 +48,10 @@ export interface DeviceInfo {
 
 export interface EngineStatus {
   model: string;
+  activeModel: ModelId;
+  defaultModel: ModelId;
+  availableModels: Array<Pick<ModelProfile, "id" | "label" | "modalities" | "maxContext">>;
+  modalities: readonly string[];
   webgpu: boolean;
   adapter: boolean;
   cached: boolean | null;
@@ -38,25 +63,61 @@ export interface EngineStatus {
   device: DeviceInfo | null;
 }
 
+export interface ListedModel extends Pick<ModelProfile, "id" | "label" | "modalities" | "maxContext"> {
+  object: "model";
+}
+
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
 
-function resolveLoadOptions(options: LoadOptions) {
+function resolveLoadOptions(options: LoadOptions, model: ModelId) {
+  const profile = getModelProfile(model);
+  const gemma = isGemmaModelId(model);
   return {
-    maxContext: Math.round(clamp(options.maxContext ?? RT.maxCtx, 1024, RT.maxCtx)),
-    batchSize: Math.round(clamp(options.batchSize ?? 8, 1, 8)),
-    mtp: options.mtp ?? false,
+    // Gemma's FP8 cache is material for every decoder layer, unlike Qwen's
+    // sparse full-attention cache.  Keep its default practical while still
+    // allowing callers to opt into its full checkpoint context window.
+    maxContext: Math.round(
+      clamp(options.maxContext ?? (gemma ? 8192 : RT.maxCtx), 1024, profile.maxContext)
+    ),
+    batchSize: Math.round(clamp(options.batchSize ?? (gemma ? 1 : 8), 1, gemma ? 1 : 8)),
+    mtp: gemma ? false : options.mtp ?? false,
   };
+}
+
+type RuntimeLoader = Loader | GemmaLoader;
+type RuntimeModel = Model | GemmaModel;
+type RuntimeTokenizer = Tokenizer | GemmaTokenizer;
+
+type BufferLike = { size: number };
+type WeightLike = {
+  q?: BufferLike;
+  s?: BufferLike;
+  size?: number;
+  shards?: Array<{ q: BufferLike; s: BufferLike }>;
+};
+
+function weightsVramBytes(weights: Record<string, unknown>): number {
+  let total = 0;
+  for (const entry of Object.values(weights) as WeightLike[]) {
+    if (!entry) continue;
+    if (entry.q && entry.s) total += entry.q.size + entry.s.size;
+    else if (entry.shards) {
+      for (const shard of entry.shards) total += shard.q.size + shard.s.size;
+    } else if (entry.size) total += entry.size;
+  }
+  return total;
 }
 
 class Engine {
   private gpu: GPU | null = null;
-  private loader: Loader | null = null;
-  private modelInstance: Model | null = null;
-  private tokInstance: Tokenizer | null = null;
+  private loader: RuntimeLoader | null = null;
+  private modelInstance: RuntimeModel | null = null;
+  private tokInstance: RuntimeTokenizer | null = null;
   private loadPromise: Promise<void> | null = null;
   private deviceInfo: DeviceInfo | null = null;
   private mtpEnabled = false;
+  private activeModel = DEFAULT_MODEL_ID;
 
   generating = false;
   committed: { sigs: string[]; toolCallCount: number; closePending: boolean } | null = null;
@@ -65,14 +126,64 @@ class Engine {
     return !!this.modelInstance && !!this.tokInstance;
   }
 
-  get model(): Model {
+  get activeModelId(): ModelId {
+    return this.activeModel;
+  }
+
+  listModels(): ListedModel[] {
+    return availableModels().map(({ id, label, modalities, maxContext }) => ({
+      id,
+      object: "model",
+      label,
+      modalities,
+      maxContext,
+    }));
+  }
+
+  get model(): RuntimeModel {
     if (!this.modelInstance) throw new Error("Model is not loaded");
     return this.modelInstance;
   }
 
-  get tok(): Tokenizer {
+  get tok(): RuntimeTokenizer {
     if (!this.tokInstance) throw new Error("Model is not loaded");
     return this.tokInstance;
+  }
+
+  get qwenModel(): Model {
+    if (this.activeModel !== QWEN_MODEL_ID || !(this.modelInstance instanceof Model)) {
+      throw new Error("Qwen is not the loaded model");
+    }
+    return this.modelInstance;
+  }
+
+  get qwenTok(): Tokenizer {
+    if (this.activeModel !== QWEN_MODEL_ID || !(this.tokInstance instanceof Tokenizer)) {
+      throw new Error("Qwen is not the loaded model");
+    }
+    return this.tokInstance;
+  }
+
+  get gemmaModel(): GemmaModel {
+    if (!isGemmaModelId(this.activeModel) || !(this.modelInstance instanceof GemmaModel)) {
+      throw new Error("Gemma is not the loaded model");
+    }
+    return this.modelInstance;
+  }
+
+  get gemmaTok(): GemmaTokenizer {
+    if (!isGemmaModelId(this.activeModel) || !(this.tokInstance instanceof GemmaTokenizer)) {
+      throw new Error("Gemma is not the loaded model");
+    }
+    return this.tokInstance;
+  }
+
+  private requestedModel(value: unknown): ModelId {
+    const candidate = value ?? this.activeModel;
+    if (!isModelId(candidate)) {
+      throw new Error(`Unsupported model: ${String(candidate)}`);
+    }
+    return candidate;
   }
 
   checkGpu(): void {
@@ -83,9 +194,11 @@ class Engine {
     }
   }
 
-  async probeCache(): Promise<boolean | null> {
+  async probeCache(model = this.activeModel): Promise<boolean | null> {
     try {
-      const probe = new Loader(null, () => {});
+      const probe = isGemmaModelId(model)
+        ? new GemmaLoader(null, () => {}, model === GEMMA_E2B_MODEL_ID ? GEMMA_E2B_CFG : GEMMA_E4B_CFG)
+        : new Loader(null, () => {});
       return !!(await probe.cacheValid());
     } catch {
       return null;
@@ -93,12 +206,17 @@ class Engine {
   }
 
   async status(): Promise<EngineStatus> {
+    const profile = getModelProfile(this.activeModel);
     const webgpu = typeof navigator !== "undefined" && !!navigator.gpu;
     const adapter = this.ready
       ? true
       : webgpu && !!(await navigator.gpu.requestAdapter().catch(() => null));
     return {
-      model: CFG.repo,
+      model: this.activeModel,
+      activeModel: this.activeModel,
+      defaultModel: DEFAULT_MODEL_ID,
+      availableModels: this.listModels(),
+      modalities: profile.modalities,
       webgpu,
       adapter,
       cached: await this.probeCache(),
@@ -112,22 +230,32 @@ class Engine {
   }
 
   async ensureLoaded(options: LoadOptions, onProgress: OnProgress): Promise<void> {
-    if (this.ready && !options.reload) return;
-    if (!this.loadPromise) {
-      this.loadPromise = this.loadModel(options, onProgress).finally(() => {
-        this.loadPromise = null;
-      });
+    const model = this.requestedModel(options.model);
+    assertModelRegistered(model);
+    if (this.ready && this.activeModel === model && !options.reload) return;
+    if (this.loadPromise) {
+      // A second caller may legitimately request a different registered
+      // model while the first model is still downloading.  Wait for the
+      // current transition, then re-evaluate rather than silently returning
+      // the wrong runtime.
+      await this.loadPromise;
+      return this.ensureLoaded(options, onProgress);
     }
+    this.loadPromise = this.loadModel({ ...options, model }, onProgress).finally(() => {
+      this.loadPromise = null;
+    });
     return this.loadPromise;
   }
 
   private async loadModel(options: LoadOptions, onProgress: OnProgress): Promise<void> {
+    const target = this.requestedModel(options.model);
+    const profile = assertModelRegistered(target);
     this.checkGpu();
     if (this.generating) {
       throw new Error("Cannot load the model while a response is generating.");
     }
 
-    const resolved = resolveLoadOptions(options);
+    const resolved = resolveLoadOptions(options, target);
     this.mtpEnabled = resolved.mtp;
 
     this.modelInstance = null;
@@ -138,10 +266,15 @@ class Engine {
     this.deviceInfo = null;
     this.committed = null;
 
-    onProgress({ stage: "tokenizer", message: "Loading tokenizer…", progress: null });
-    const tok = await Tokenizer.load((message: string) =>
-      onProgress({ stage: "tokenizer", message, progress: null })
-    );
+    onProgress({ stage: "tokenizer", message: `Loading ${profile.label} tokenizer…`, progress: null });
+    const gemmaConfig = target === GEMMA_E2B_MODEL_ID ? GEMMA_E2B_CFG : GEMMA_E4B_CFG;
+    const tok = isGemmaModelId(target)
+      ? await GemmaTokenizer.load((message: string) =>
+          onProgress({ stage: "tokenizer", message, progress: null })
+        , gemmaConfig)
+      : await Tokenizer.load((message: string) =>
+          onProgress({ stage: "tokenizer", message, progress: null })
+        );
 
     onProgress({ stage: "gpu", message: "Initializing WebGPU…", progress: null });
     let gpuError: string | null = null;
@@ -150,53 +283,56 @@ class Engine {
     });
     if (gpuError) throw new Error(gpuError);
 
-    this.loader = new Loader(gpu, (message: string, phase?: string, frac?: number | null) =>
-      onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
-    );
+    this.loader = isGemmaModelId(target)
+      ? new GemmaLoader(gpu, (message: string, phase?: string, frac?: number | null) =>
+          onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
+        , gemmaConfig)
+      : new Loader(gpu, (message: string, phase?: string, frac?: number | null) =>
+          onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
+        );
     const weights = await this.loader.load();
 
-    onProgress({ stage: "pipelines", message: "Building pipelines…", progress: 1 });
-    const model = new Model(gpu, weights, { maxCtx: resolved.maxContext });
+    onProgress({ stage: "pipelines", message: `Building ${profile.label} pipelines…`, progress: 1 });
+    const model = isGemmaModelId(target)
+      ? new GemmaModel(gpu, weights as GemmaWeightsMap, { maxCtx: resolved.maxContext, config: gemmaConfig })
+      : new Model(gpu, weights as WeightsMap, { maxCtx: resolved.maxContext });
     model.BATCH = resolved.batchSize;
     model.spec = !!model.hasMtp && resolved.mtp;
     await model.reset();
 
-    type BufLike = { size: number };
-    type WeightEntry = { q?: BufLike; s?: BufLike; size?: number };
-    let vram = 0;
-    for (const w of Object.values(weights) as WeightEntry[]) {
-      if (w?.q && w.s) vram += w.q.size + w.s.size;
-      else if (w?.size) vram += w.size;
-    }
-    const embShards = (weights as Record<string, unknown>).embShards;
-    if (Array.isArray(embShards)) {
-      for (const sh of embShards as Array<{ q: BufLike; s: BufLike }>) {
-        vram += sh.q.size + sh.s.size;
-      }
-    }
+    const vram = weightsVramBytes(weights as Record<string, unknown>);
 
     this.gpu = gpu;
     this.tokInstance = tok;
     this.modelInstance = model;
+    this.activeModel = target;
     this.deviceInfo = {
       vendor: gpu.info?.vendor ?? "unknown",
       architecture: gpu.info?.architecture ?? "",
       vramBytes: vram,
     };
-    onProgress({ stage: "ready", message: "Model ready.", progress: 1 });
+    onProgress({ stage: "ready", message: `${profile.label} ready.`, progress: 1 });
   }
 
   updateRuntime(options: { batchSize?: number; mtp?: boolean }): void {
     if (options.mtp !== undefined) this.mtpEnabled = !!options.mtp;
     if (!this.modelInstance) return;
     if (options.batchSize !== undefined) {
-      this.modelInstance.BATCH = Math.round(clamp(options.batchSize, 1, 8));
+      this.modelInstance.BATCH = Math.round(
+        clamp(options.batchSize, 1, isGemmaModelId(this.activeModel) ? 1 : 8)
+      );
     }
     this.modelInstance.spec = !!this.modelInstance.hasMtp && this.mtpEnabled;
   }
 
-  async wipeCache(): Promise<void> {
-    const loader = this.loader ?? new Loader(null, () => {});
+  async wipeCache(options: { model?: ModelId } = {}): Promise<void> {
+    const model = this.requestedModel(options.model);
+    assertModelRegistered(model);
+    const loader = this.loader && model === this.activeModel
+      ? this.loader
+      : isGemmaModelId(model)
+        ? new GemmaLoader(null, () => {}, model === GEMMA_E2B_MODEL_ID ? GEMMA_E2B_CFG : GEMMA_E4B_CFG)
+        : new Loader(null, () => {});
     await loader.clearCache();
   }
 }

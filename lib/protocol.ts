@@ -5,7 +5,6 @@ import {
   type CompletionDelta,
   type CompletionRequest,
 } from "./completions";
-import { CFG } from "./webgpu-llm/config.js";
 import { originAllowed } from "./allowed-origins";
 
 export const NS = "mach-llm";
@@ -46,11 +45,15 @@ export function attachProtocol(win: Window): () => void {
     try {
       switch (method) {
         case "ping": {
-          reply("result", { version: PROTOCOL_VERSION, model: CFG.repo });
+          reply("result", { version: PROTOCOL_VERSION, model: engine.activeModelId });
           break;
         }
         case "status": {
           reply("result", await engine.status());
+          break;
+        }
+        case "models.list": {
+          reply("result", { object: "list", data: engine.listModels() });
           break;
         }
         case "load": {
@@ -65,7 +68,7 @@ export function attachProtocol(win: Window): () => void {
         }
         case "cache.wipe": {
           if (busy) throw Object.assign(new Error("The engine is busy."), { code: "busy" });
-          await engine.wipeCache();
+          await engine.wipeCache((params ?? {}) as { model?: LoadOptions["model"] });
           reply("result", { wiped: true });
           break;
         }
@@ -84,7 +87,7 @@ export function attachProtocol(win: Window): () => void {
           const controller = new AbortController();
           inflight.set(id, controller);
           try {
-            await engine.ensureLoaded({}, progressChunk);
+            await engine.ensureLoaded({ model: request.model }, progressChunk);
             const completionId = `chatcmpl-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
             const created = Math.floor(Date.now() / 1000);
             const chunkOf = (
@@ -94,7 +97,7 @@ export function attachProtocol(win: Window): () => void {
               id: completionId,
               object: "chat.completion.chunk",
               created,
-              model: CFG.repo,
+              model: engine.activeModelId,
               choices: [{ index: 0, delta, finish_reason: finishReason }],
             });
 
@@ -123,7 +126,7 @@ export function attachProtocol(win: Window): () => void {
               id: completionId,
               object: "chat.completion",
               created,
-              model: CFG.repo,
+              model: engine.activeModelId,
               choices: [
                 {
                   index: 0,
@@ -159,7 +162,7 @@ export function attachProtocol(win: Window): () => void {
   win.addEventListener("message", onMessage);
   if (win.parent && win.parent !== win) {
     win.parent.postMessage(
-      { ns: NS, type: "ready", version: PROTOCOL_VERSION, model: CFG.repo },
+      { ns: NS, type: "ready", version: PROTOCOL_VERSION, model: engine.activeModelId },
       "*"
     );
   }

@@ -7,16 +7,17 @@
 //   </parameter>
 //   </function>
 //   </tool_call>
-// All of this app's existing tools take only string parameters, so parameter
-// values are used as raw strings — no JSON parsing of scalar args for v1.
+// Parameter values are parsed as JSON literals when possible, preserving the
+// native XML wrapper while allowing schema-constrained scalar/object values.
 
 export interface ParsedToolCall {
   name: string;
-  arguments: Record<string, string>;
+  arguments: Record<string, unknown>;
 }
 
 const TOOL_CALL_OPEN = "<tool_call>";
 const TOOL_CALL_CLOSE = "</tool_call>";
+const FUNCTION_OPEN = "<function=";
 const FUNCTION_OPEN_RE = /<function=([^>]+)>/;
 const PARAMETER_RE = /<parameter=([^>]+)>\n?([\s\S]*?)\n?<\/parameter>/g;
 
@@ -57,16 +58,28 @@ export class ToolCallStreamParser {
 
     if (this.state === "idle") {
       this.preBuffer += piece;
-      const idx = this.preBuffer.indexOf(TOOL_CALL_OPEN);
+      const explicitIdx = this.preBuffer.indexOf(TOOL_CALL_OPEN);
+      // The trained Qwen grammar normally begins with <tool_call>. If the
+      // model skips that wrapper but starts a native function block, enter
+      // tool mode anyway so the decoder can constrain the remainder.
+      const implicitIdx = this.preBuffer.indexOf(FUNCTION_OPEN);
+      const idx = explicitIdx >= 0 && (implicitIdx < 0 || explicitIdx <= implicitIdx)
+        ? explicitIdx
+        : implicitIdx;
       if (idx < 0) {
         // hold back a tail in case the open tag itself spans chunks
-        const keep = Math.min(this.preBuffer.length, TOOL_CALL_OPEN.length - 1);
+        const keep = Math.min(
+          this.preBuffer.length,
+          Math.max(TOOL_CALL_OPEN.length, FUNCTION_OPEN.length) - 1
+        );
         const visible = this.preBuffer.slice(0, this.preBuffer.length - keep);
         this.preBuffer = this.preBuffer.slice(this.preBuffer.length - keep);
         return visible;
       }
       const visible = this.preBuffer.slice(0, idx);
-      this.buffer = this.preBuffer.slice(idx + TOOL_CALL_OPEN.length);
+      this.buffer = explicitIdx === idx
+        ? this.preBuffer.slice(idx + TOOL_CALL_OPEN.length)
+        : this.preBuffer.slice(idx);
       this.preBuffer = "";
       this.state = "in-call";
       this.tryParseFunctionName();
@@ -104,12 +117,13 @@ export class ToolCallStreamParser {
   }
 }
 
-function parseToolCallBody(inner: string): ParsedToolCall {
+export function parseToolCallBody(inner: string): ParsedToolCall {
   const fnMatch = FUNCTION_OPEN_RE.exec(inner);
   const name = fnMatch ? fnMatch[1].trim() : "";
-  const args: Record<string, string> = {};
+  const args: Record<string, unknown> = {};
   for (const m of inner.matchAll(PARAMETER_RE)) {
-    args[m[1].trim()] = m[2];
+    const value = m[2].trim();
+    try { args[m[1].trim()] = JSON.parse(value); } catch { args[m[1].trim()] = m[2]; }
   }
   return { name, arguments: args };
 }

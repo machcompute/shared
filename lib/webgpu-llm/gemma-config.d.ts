@@ -1,0 +1,97 @@
+export interface GemmaConfig {
+  id: string;
+  label: string;
+  repo: string;
+  revision: string;
+  checkpoint: string;
+  cacheNamespace: string;
+  cacheVersion: number;
+  schemaVersion: number;
+  text: {
+    hidden: number;
+    layers: number;
+    interm: number;
+    doubleWideMlpFrom?: number;
+    vocab: number;
+    eps: number;
+    heads: number;
+    kvHeads: number;
+    slidingHeadDim: number;
+    globalHeadDim: number;
+    slidingWindow: number;
+    slidingRopeDim: number;
+    fullRopeDim: number;
+    fullRotaryDim: number;
+    fullRotaryFactor: number;
+    slidingRopeTheta: number;
+    fullRopeTheta: number;
+    pleDim: number;
+    plePackedDim: number;
+    embedScale: number;
+    pleEmbedScale: number;
+    pleInputScale: number;
+    pleModelProjectionScale: number;
+    declaredKvSharedLayers: number;
+    hiddenActivation: string;
+    attentionScale: number;
+    finalLogitSoftcap: number;
+  };
+  vision: {
+    hidden: number;
+    layers: number;
+    interm: number;
+    heads: number;
+    headDim: number;
+    patchSize: number;
+    positionEmbeddingSize: number;
+    poolingKernel: number;
+    softTokensPerImage: number;
+    eps: number;
+    ropeTheta: number;
+    hiddenActivation: string;
+    attentionScale: number;
+    useClippedLinears: boolean;
+    standardize: boolean;
+  };
+  audio: {
+    hidden: number;
+    layers: number;
+    interm: number;
+    heads: number;
+    headDim: number;
+    outputDim: number;
+    convKernel: number;
+    subsampleChannels: number[];
+    attentionChunk: number;
+    attentionLeft: number;
+    attentionPastHorizon: number;
+    attentionRight: number;
+    eps: number;
+    hiddenActivation: string;
+    attentionLogitCap: number;
+    residualWeight: number;
+    gradientClipping: number;
+    useClippedLinears: boolean;
+  };
+  tokens: Record<string, number>;
+  layerTypes?: Array<'full_attention' | 'sliding_attention'>;
+  declaredSharedKvSource?: { sliding_attention: number; full_attention: number };
+}
+
+export type GemmaE4BConfig = GemmaConfig;
+
+export declare const GEMMA_E4B_CFG: GemmaConfig;
+export declare const GEMMA_E2B_CFG: GemmaConfig;
+export declare const GEMMA_E4B_LAYER_TYPES: Array<'full_attention' | 'sliding_attention'>;
+export declare function isGemmaE4BFullAttention(layer: number): boolean;
+export declare const GEMMA_E4B_DECLARED_KV_SHARED_FROM: number;
+export declare const GEMMA_E4B_DECLARED_SHARED_KV_SOURCE: {
+  sliding_attention: number;
+  full_attention: number;
+};
+export declare const GEMMA_E4B_CHECKPOINT_HAS_PER_LAYER_KV: true;
+export declare function isGemmaE4BDeclaredKvSharedLayer(layer: number): boolean;
+export declare function gemmaLayerTypes(config: GemmaConfig): Array<'full_attention' | 'sliding_attention'>;
+export declare function isGemmaFullAttention(config: GemmaConfig, layer: number): boolean;
+export declare function isGemmaDeclaredKvSharedLayer(config: GemmaConfig, layer: number): boolean;
+export declare function gemmaSharedKvSource(config: GemmaConfig, kind: 'sliding_attention' | 'full_attention'): number;

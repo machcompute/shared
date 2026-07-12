@@ -6,6 +6,8 @@ export declare class Tokenizer {
   encode(text: string): number[];
   sanitize(text: string): string;
   makeDecoder(): (id: number) => string;
+  vocabSize(): number;
+  specialTokenId(text: string): number | undefined;
 }
 
 export declare function sample(

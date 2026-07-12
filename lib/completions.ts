@@ -8,6 +8,10 @@ import {
 } from "./webgpu-llm/chat-template";
 import { ToolCallStreamParser } from "./webgpu-llm/tool-call-parser";
 import { sample } from "./webgpu-llm/tokenizer.js";
+import { isGemmaModelId, type ModelId } from "./webgpu-llm/model-registry";
+import { runGemmaCompletion } from "./gemma-completions";
+import { ToolConstraint } from "./webgpu-llm/tool-constraint";
+import { parseToolCallBody } from "./webgpu-llm/tool-call-parser";
 
 export interface ToolCall {
   id: string;
@@ -18,12 +22,17 @@ export interface ToolCall {
   };
 }
 
+export type ChatContent = string | unknown[];
+
 export type ChatMessage =
-  | { role: "system" | "user"; content: string }
+  | { role: "system" | "user"; content: ChatContent }
   | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
   | { role: "tool"; content: string; tool_call_id?: string };
 
+type QwenChatMessage = ChatMessage & { content: string };
+
 export interface CompletionRequest {
+  model?: ModelId;
   messages: ChatMessage[];
   tools?: FunctionToolDef[];
   parallel_tool_calls?: boolean;
@@ -98,19 +107,25 @@ export function validateMessages(input: unknown): ChatMessage[] {
     if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
       throw new Error(`messages[${i}].role must be "system", "user", "assistant" or "tool"`);
     }
-    if (typeof content !== "string") {
-      throw new Error(`messages[${i}].content must be a string`);
+    if (typeof content !== "string" && !Array.isArray(content)) {
+      throw new Error(`messages[${i}].content must be a string or a content-parts array`);
     }
     if (role === "system" && i !== 0) {
       throw new Error("a system message is only allowed as the first message");
     }
     if (role !== "assistant") {
+      if (role !== "user" && typeof content !== "string") {
+        throw new Error(`messages[${i}].content must be a string for ${role} messages`);
+      }
       if (m.tool_calls !== undefined) {
         throw new Error(`messages[${i}].tool_calls is only allowed on assistant messages`);
       }
       return role === "tool"
-        ? { role, content, tool_call_id: typeof m.tool_call_id === "string" ? m.tool_call_id : undefined }
+        ? { role, content: content as string, tool_call_id: typeof m.tool_call_id === "string" ? m.tool_call_id : undefined }
         : { role, content };
+    }
+    if (typeof content !== "string") {
+      throw new Error(`messages[${i}].content must be a string for assistant messages`);
     }
     if (m.tool_calls === undefined) return { role, content };
     if (!Array.isArray(m.tool_calls)) {
@@ -138,6 +153,16 @@ export function validateMessages(input: unknown): ChatMessage[] {
   return messages;
 }
 
+function assertQwenTextMessages(messages: ChatMessage[]): asserts messages is QwenChatMessage[] {
+  for (let i = 0; i < messages.length; i++) {
+    if (typeof messages[i].content !== "string") {
+      throw new Error(
+        "Image, audio, and video content requires a Gemma 4 E2B or E4B model."
+      );
+    }
+  }
+}
+
 function parseArgs(argsJson: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(argsJson);
@@ -147,7 +172,7 @@ function parseArgs(argsJson: string): Record<string, unknown> {
   }
 }
 
-function toRenderMessages(messages: ChatMessage[], sanitize: (s: string) => string): RenderMessage[] {
+function toRenderMessages(messages: QwenChatMessage[], sanitize: (s: string) => string): RenderMessage[] {
   return messages.map((m): RenderMessage => {
     if (m.role === "assistant" && m.tool_calls?.length) {
       return {
@@ -169,9 +194,13 @@ export async function runCompletion(
   emitDelta: (delta: CompletionDelta) => void,
   emitProgress: (event: ProgressEvent) => void
 ): Promise<CompletionResult> {
+  if (isGemmaModelId(engine.activeModelId)) {
+    return runGemmaCompletion(request, signal, emitDelta, emitProgress);
+  }
   const messages = validateMessages(request.messages);
-  const model = engine.model;
-  const tok = engine.tok;
+  assertQwenTextMessages(messages);
+  const model = engine.qwenModel;
+  const tok = engine.qwenTok;
   const thinking = request.thinking ?? true;
 
   const samplingParams = {
@@ -235,6 +264,13 @@ export async function runCompletion(
   if (toolCallCloseId === undefined) {
     throw new Error("Tokenizer is missing the </tool_call> special token");
   }
+  const constraint = request.tools?.length
+    ? new ToolConstraint(request.tools, tok, {
+        closeToken: "</tool_call>",
+        namePrefix: "<function=",
+        forbiddenTokenIds: [tok.eos],
+      })
+    : null;
   const maxNew = Math.max(1, Math.min(request.max_tokens ?? model.maxCtx, model.maxCtx));
   const stopIds = [tok.eos, toolCallCloseId];
   const decodeTok = tok.makeDecoder();
@@ -322,10 +358,11 @@ export async function runCompletion(
       totalN++;
       if (toolParser.isComplete) break;
 
-      const k = Math.min(model.BATCH, maxNew - totalN, model.maxCtx - model.pos - 1);
+      const constrained = !!constraint && toolParser.isOpen;
+      const k = Math.min(constrained ? 1 : model.BATCH, maxNew - totalN, model.maxCtx - model.pos - 1);
       if (k < 1) break;
 
-      if (model.spec && model.hasMtp && k >= 3) {
+      if (!constrained && model.spec && model.hasMtp && k >= 3) {
         const maxSpecRounds = (model as unknown as { R?: number }).R ?? 1;
         const r = await model.specChain(
           next,
@@ -377,10 +414,15 @@ export async function runCompletion(
         continue;
       }
 
+      const allowedTokenIds = constrained
+        ? constraint!.allowed(toolParser.rawBuffer, parseToolCallBody)
+        : undefined;
+      if (allowedTokenIds && !allowedTokenIds.length) throw new Error("Tool call cannot satisfy the declared schema.");
       const r = await model.decodeBatch(next, k, {
         ...samplingParams,
         stopIds,
         seed: randSeed(),
+        allowedTokenIds,
       });
       for (let j = 0; j < r.ids.length; j++) {
         const id = r.ids[j];

@@ -44,6 +44,9 @@ export class MachLLM {
         create: (params, options) => this.#createCompletion(params, options),
       },
     };
+    this.models = {
+      list: () => this.#request("models.list"),
+    };
   }
 
   static async connect(options = {}) {
@@ -105,8 +108,8 @@ export class MachLLM {
     return this.#request("settings.update", options);
   }
 
-  wipeCache() {
-    return this.#request("cache.wipe");
+  wipeCache(options) {
+    return this.#request("cache.wipe", options);
   }
 
   close() {

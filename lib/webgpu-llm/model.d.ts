@@ -11,6 +11,8 @@ export interface SampleParams {
   eosId?: number;
   stopIds?: number[];
   seed?: number;
+  /** Sorted whitelist applied by the GPU top-k kernel before sampling. */
+  allowedTokenIds?: Uint32Array;
 }
 
 export interface Candidates {
