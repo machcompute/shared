@@ -125,7 +125,22 @@ class Engine {
   private activeModel = DEFAULT_MODEL_ID;
 
   generating = false;
-  committed: { sigs: string[]; toolCallCount: number; closePending: boolean } | null = null;
+  /**
+   * GPU-resident conversation prefix from the last clean completion. When the
+   * next request strictly extends `sigs` under the same `model` + `promptKey`
+   * (thinking flag + tool declarations rendered into the prompt prefix), the
+   * runtime skips model.reset() and prefills only the suffix. `pending` names
+   * canonical text the cache is missing because the final stop token was
+   * sampled but never fed: the turn-close marker, the tool-call close tag, or
+   * nothing (a lookahead already fed the close).
+   */
+  committed: {
+    model: ModelId;
+    promptKey: string;
+    sigs: string[];
+    toolCallCount: number;
+    pending: "turn-close" | "tool-close" | "none";
+  } | null = null;
 
   get ready() {
     return !!this.modelInstance && !!this.tokInstance;

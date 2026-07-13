@@ -213,20 +213,30 @@ export class ToolConstraint {
   private gemmaTokenIds(): GemmaTokenIds {
     if (this.gemmaIds) return this.gemmaIds;
     const single = (text: string): number | undefined => this.tokenizer.encode(text)[0];
-    const number = new Set<number>();
+    // Numeric tokens split by shape so the walker can keep a numeral on a
+    // schema-valid trajectory: pure digit runs extend any number, dotted
+    // tokens start/continue a decimal fraction exactly once. Exponent and
+    // sign-bearing multi-char tokens are excluded outright — tool arguments
+    // never need them and each one opens a can-never-recover trap.
+    const digits = new Set<number>();
+    const dotted = new Set<number>();
+    const classify = (id: number, text: string) => {
+      if (/^[0-9]+$/.test(text)) digits.add(id);
+      else if (/^[0-9]*\.[0-9]*$/.test(text)) dotted.add(id);
+    };
     const textOf = this.tokenizer.tokenText?.bind(this.tokenizer);
     if (textOf) {
       const size = this.tokenizer.vocabSize();
       for (let id = 0; id < size; id++) {
         if (id === this.closeId || this.forbiddenIds.has(id)) continue;
         const text = textOf(id);
-        if (text && /^[0-9eE+.\-]+$/.test(text)) number.add(id);
+        if (text) classify(id, text);
       }
     }
-    // Digit-by-digit fallback keeps numbers writable without tokenText.
-    for (const ch of ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '.', 'e', 'E', '+']) {
+    // Char-by-char fallback keeps numbers writable without tokenText.
+    for (const ch of ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.']) {
       const id = single(ch);
-      if (id !== undefined && !this.forbiddenIds.has(id)) number.add(id);
+      if (id !== undefined && !this.forbiddenIds.has(id)) classify(id, ch);
     }
     this.gemmaIds = {
       quote: this.tokenizer.specialTokenId(GEMMA_QUOTE) ?? single(GEMMA_QUOTE),
@@ -235,9 +245,44 @@ export class ToolConstraint {
       openBracket: single('['),
       closeBracket: single(']'),
       comma: single(','),
-      number: Uint32Array.from([...number].sort((a, b) => a - b)),
+      minus: single('-'),
+      digits: Uint32Array.from([...digits].sort((a, b) => a - b)),
+      dotted: Uint32Array.from([...dotted].sort((a, b) => a - b)),
     };
     return this.gemmaIds;
+  }
+
+  /**
+   * Numeral continuations that can still reach a schema-valid value.
+   * Growth rules close the traps a free digit lattice leaves open: integers
+   * never admit a decimal point, the integer part may not grow past a
+   * declared bound (appending a digit multiplies it by ten), a fraction dot
+   * appears at most once, and past double precision only a valid stop
+   * remains.
+   */
+  private gemmaNumberTokens(text: string, schema: unknown, frame: GemmaFrame | undefined): Uint32Array {
+    const T = this.gemmaTokenIds();
+    const s = (schema && typeof schema === "object" && !Array.isArray(schema) ? schema : {}) as JsonSchema;
+    const info = gemmaSchemaKinds(schema);
+    const integerOnly = info.kinds.has("integer") && !info.kinds.has("number");
+    const value = Number(text);
+    const valid = text !== "" && Number.isFinite(value) && typeMatches(value, schema);
+    const delimiters = valid ? this.gemmaDelimiters(frame, true) : [];
+    if ([...text].length >= 17) return sortedIds(delimiters);
+
+    const ids = new Set<number>(delimiters);
+    const hasDot = text.includes(".");
+    let digitsOk = true;
+    if (!hasDot && text !== "" && text !== "-" && Number.isFinite(value)) {
+      const maxBound = numberKeyword(s, "maximum") ?? numberKeyword(s, "exclusiveMaximum");
+      const minBound = numberKeyword(s, "minimum") ?? numberKeyword(s, "exclusiveMinimum");
+      if (value > 0 && maxBound !== undefined && value * 10 > maxBound) digitsOk = false;
+      if (value < 0 && minBound !== undefined && value * 10 < minBound) digitsOk = false;
+    }
+    if (digitsOk) for (const id of T.digits) ids.add(id);
+    if (!integerOnly && !hasDot) for (const id of T.dotted) ids.add(id);
+    if (text === "" && T.minus !== undefined) ids.add(T.minus);
+    return sortedIds(ids);
   }
 
   private requirePrefix(emitted: string, targets: string[]): Uint32Array | null {
@@ -357,17 +402,8 @@ export class ToolConstraint {
         return this.gemmaValueStart(state.schema, state.frame);
       case "inString":
         return this.gemmaInString(state.schema, state.content);
-      case "inNumber": {
-        // A runaway numeral can never become schema-valid; 30 characters
-        // exceeds every finite JSON number a model should emit.
-        if (state.text.length > 30) return new Uint32Array();
-        const ids = new Set<number>(this.gemmaTokenIds().number);
-        const value = Number(state.text);
-        if (state.text !== "" && Number.isFinite(value) && typeMatches(value, state.schema)) {
-          for (const id of this.gemmaDelimiters(state.frame, true)) ids.add(id);
-        }
-        return sortedIds(ids);
-      }
+      case "inNumber":
+        return this.gemmaNumberTokens(state.text, state.schema, state.frame);
       case "inWord": {
         const words = gemmaWordTargets(state.schema);
         const matching = words.filter((word) => word.startsWith(state.text));
@@ -392,7 +428,9 @@ export class ToolConstraint {
     const T = this.gemmaTokenIds();
     const ids = new Set<number>();
     if (info.kinds.has("string") && T.quote !== undefined) ids.add(T.quote);
-    if (info.kinds.has("number") || info.kinds.has("integer")) for (const id of T.number) ids.add(id);
+    if (info.kinds.has("number") || info.kinds.has("integer")) {
+      for (const id of this.gemmaNumberTokens("", schema, undefined)) ids.add(id);
+    }
     for (const id of this.firstTokens(gemmaWordTargets(schema))) ids.add(id);
     if (info.kinds.has("object") && T.openBrace !== undefined) ids.add(T.openBrace);
     if (info.kinds.has("array") && T.openBracket !== undefined) ids.add(T.openBracket);
@@ -493,7 +531,9 @@ interface GemmaTokenIds {
   openBracket?: number;
   closeBracket?: number;
   comma?: number;
-  number: Uint32Array;
+  minus?: number;
+  digits: Uint32Array;
+  dotted: Uint32Array;
 }
 
 interface GemmaObjFrame {

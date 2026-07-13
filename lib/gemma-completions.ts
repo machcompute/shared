@@ -1,12 +1,20 @@
 import { engine, type ProgressEvent } from "./engine";
 import {
+  messageSig,
+  promptPrefixKey,
   validateMessages,
   type CompletionDelta,
   type CompletionRequest,
   type CompletionResult,
+  type ChatMessage,
   type ToolCall,
 } from "./completions";
-import { prepareGemmaPrompt } from "./gemma-processor";
+import {
+  prepareGemmaPrompt,
+  prepareGemmaToolResponsesSuffix,
+  prepareGemmaUserTurnSuffix,
+  type PreparedGemmaPrompt,
+} from "./gemma-processor";
 import { GemmaToolCallParser, parseGemmaToolCallBody } from "./webgpu-llm/gemma-tool-parser";
 import { ToolConstraint } from "./webgpu-llm/tool-constraint";
 import { sample } from "./webgpu-llm/tokenizer.js";
@@ -102,24 +110,108 @@ export async function runGemmaCompletion(
     : null;
 
   model.resetPenaltyWindow();
-  await model.reset();
+  // The tool-constraint mask survives on the model between requests; only
+  // reset() cleared it before suffix continuations existed.
+  model.clearAllowedTokenIds();
 
-  const prompt = await prepareGemmaPrompt(messages, tok, model, {
-    thinking,
-    signal,
-    tools: request.tools,
-    onStage: (message) => emitProgress({ stage: "media", message, progress: null }),
-  });
+  const onStage = (message: string) => emitProgress({ stage: "media", message, progress: null });
+  const sigs = messages.map(messageSig);
+  const promptKey = promptPrefixKey(thinking, request.tools);
+  const committed = engine.committed;
+  engine.committed = null;
+  const extra =
+    committed &&
+    committed.model === engine.activeModelId &&
+    committed.promptKey === promptKey &&
+    messages.length > committed.sigs.length &&
+    committed.sigs.every((sig, i) => sig === sigs[i])
+      ? messages.slice(committed.sigs.length)
+      : null;
+
+  // Suffix continuations skip model.reset() and prefill on top of the
+  // GPU-resident prefix. The cache keeps the model's own generated stream —
+  // including reasoning the full render would drop — so a continuation and a
+  // fresh render condition slightly differently; that trade matches Qwen.
+  let prompt: PreparedGemmaPrompt | null = null;
+  const priorToolMessages = extra?.filter(
+    (m): m is ChatMessage & { role: "tool" } => m.role === "tool",
+  );
+  if (extra && committed && extra.length === 1 && extra[0].role === "user" && committed.toolCallCount === 0) {
+    prompt = await prepareGemmaUserTurnSuffix(extra[0], tok, model, {
+      signal,
+      basePos: model.pos,
+      onStage,
+    });
+  } else if (
+    extra &&
+    committed &&
+    committed.toolCallCount > 0 &&
+    priorToolMessages &&
+    priorToolMessages.length === committed.toolCallCount &&
+    extra.slice(0, priorToolMessages.length).every((m) => m.role === "tool") &&
+    // The delta is the round's tool responses, optionally followed by one
+    // injected user turn (e.g. a screenshot of the tool's result).
+    (extra.length === committed.toolCallCount ||
+      (extra.length === committed.toolCallCount + 1 && extra[extra.length - 1].role === "user"))
+  ) {
+    const prior = messages[committed.sigs.length - 1];
+    const priorCalls = prior.role === "assistant" ? prior.tool_calls ?? [] : [];
+    const toolSuffix = prepareGemmaToolResponsesSuffix(
+      priorToolMessages.map((m) => ({
+        name: priorCalls.find((tc) => tc.id === m.tool_call_id)?.function.name ?? "unknown",
+        content: m.content,
+      })),
+      tok,
+      { pending: committed.pending === "tool-close" ? "tool-close" : "none" },
+    );
+    const trailingUser = extra.length > committed.toolCallCount ? extra[extra.length - 1] : null;
+    if (trailingUser) {
+      // A user turn directly after tool responses does not close the model
+      // turn first — the renderer leaves it open after responses.
+      const userSuffix = await prepareGemmaUserTurnSuffix(trailingUser, tok, model, {
+        signal,
+        basePos: model.pos + toolSuffix.tokenIds.length,
+        onStage,
+        closeTurn: false,
+      });
+      prompt = {
+        tokenIds: [...toolSuffix.tokenIds, ...userSuffix.tokenIds],
+        overrides: userSuffix.overrides,
+        mediaTokenCount: userSuffix.mediaTokenCount,
+      };
+    } else {
+      prompt = toolSuffix;
+    }
+  }
+  if (prompt && model.pos + prompt.tokenIds.length >= model.maxCtx - 1) {
+    // The continuation overflows; a full render is more compact (it drops
+    // prior generated reasoning) and may still fit.
+    prompt = null;
+  }
+  if (!prompt) {
+    await model.reset();
+    prompt = await prepareGemmaPrompt(messages, tok, model, {
+      thinking,
+      signal,
+      tools: request.tools,
+      onStage,
+    });
+  }
   if (model.pos + prompt.tokenIds.length >= model.maxCtx - 1) {
     throw new Error(
       `Prompt is too long: ${prompt.tokenIds.length} tokens does not fit the ${model.maxCtx}-token Gemma context window.`
     );
   }
+  // Gemma 4's model card standardizes sampling at temperature 1.0 / top-p
+  // 0.95 / top-k 64 with repetition penalties off. A presence penalty is
+  // actively harmful under constrained tool-call decoding — digits, commas,
+  // and quote markers all live inside the penalty window. Top-k stays at the
+  // GPU top-k gather width (20 candidates).
   const sampling = {
-    temperature: clamp(request.temperature ?? 0.6, 0, 2),
+    temperature: clamp(request.temperature ?? 1.0, 0, 2),
     topP: clamp(request.top_p ?? 0.95, 0.05, 1),
     topK: Math.round(clamp(request.top_k ?? 20, 1, 128)),
-    presencePenalty: clamp(request.presence_penalty ?? 1.5, 0, 2),
+    presencePenalty: clamp(request.presence_penalty ?? 0, 0, 2),
   };
   const cands = await model.prefill(
     prompt.tokenIds,
@@ -143,6 +235,9 @@ export async function runGemmaCompletion(
   let total = 0;
 
   const toolCalls: ToolCall[] = [];
+  // Whether the latest tool call's close tag reached the KV cache (only the
+  // parallel-call lookahead feeds it; as a stop token it is sampled unfed).
+  let lastCloseFed = false;
   let toolParser = new GemmaToolCallParser();
   let toolIndex = 0;
   let toolCallId = makeToolCallId(toolIndex);
@@ -257,14 +352,22 @@ export async function runGemmaCompletion(
       type: "function",
       function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments) },
     });
+    lastCloseFed = false;
     if (!parallelCalls || signal.aborted || total >= maxNew || model.maxCtx - model.pos - 1 < 2) break;
 
     const cont = await model.decodeBatch(next, 1, { ...sampling, stopIds, eosId: tok.eos });
+    // That call fed the pending close into the cache as its input token.
+    lastCloseFed = true;
     next = cont.ids[0];
     // `next` is a fresh token even if the loop above exited with a consumed
     // pivot (a tool call completing mid-batch leaves nextConsumed set).
     nextConsumed = false;
-    stopped = cont.stopped || stopIds.includes(next);
+    // A sampled <|tool_response> opener means the model is done calling and
+    // awaits results. Treat it as a stop: consuming it would let the model
+    // hallucinate a tool response into the cache, and the real response
+    // suffix supplies its own opener (this token was sampled, never fed).
+    stopped = cont.stopped || stopIds.includes(next)
+      || next === tok.specialTokenId("<|tool_response>");
     toolParser = new GemmaToolCallParser();
     toolIndex++;
     toolCallId = makeToolCallId(toolIndex);
@@ -274,8 +377,22 @@ export async function runGemmaCompletion(
 
   emitContent(toolParser.flush());
 
-  engine.committed = null;
   const finalToolCalls = toolCalls.length ? toolCalls : null;
+  // Commit only clean stops: a length-capped turn leaves its final sampled
+  // token consumed into `content` but never fed, so the cache would diverge
+  // from the assistant message the client echoes back.
+  if (stopped && !signal.aborted) {
+    engine.committed = {
+      model: engine.activeModelId,
+      promptKey,
+      sigs: [
+        ...sigs,
+        messageSig({ role: "assistant", content, tool_calls: finalToolCalls ?? undefined }),
+      ],
+      toolCallCount: toolCalls.length,
+      pending: toolCalls.length ? (lastCloseFed ? "none" : "tool-close") : "turn-close",
+    };
+  }
   return {
     content,
     reasoning_content: reasoning,

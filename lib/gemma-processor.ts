@@ -74,26 +74,25 @@ async function mediaEmbeddings(
   return embeddings;
 }
 
+interface GemmaPromptBuilder {
+  appendText(text: string): void;
+  emitContent(message: ChatMessage): Promise<{ hasContent: boolean; mediaType: GemmaMediaType | null }>;
+  finish(): PreparedGemmaPrompt;
+}
+
 /**
- * Preprocess mixed OpenAI-style content, encode each modality, and construct
- * the exact Gemma turn protocol plus embedding overrides. Boundary tokens
- * remain in the language sequence; repeated media placeholder IDs are
- * replaced with projections matching the loaded text decoder's width.
+ * Shared token/override assembly for full prompts and suffix continuations.
+ * `basePos` offsets media override keys: `#submitEmbeddings` resolves them as
+ * absolute decoder positions, so a suffix prefilled at `model.pos > 0` must
+ * key its overrides from that position, not from the suffix start.
  */
-export async function prepareGemmaPrompt(
-  messages: ChatMessage[],
+function promptBuilder(
   tokenizer: GemmaTokenizer,
   model: GemmaModel,
-  options: {
-    thinking: boolean;
-    signal: AbortSignal;
-    tools?: FunctionToolDef[];
-    onStage?: (message: string) => void;
-  },
-): Promise<PreparedGemmaPrompt> {
-  const { thinking, signal } = options;
-  const onStage = options.onStage ?? (() => {});
-  const tools = options.tools ?? [];
+  signal: AbortSignal,
+  onStage: (message: string) => void,
+  basePos = 0,
+): GemmaPromptBuilder {
   const sanitize = (text: string) => tokenizer.sanitize(text);
   const tokens: number[] = [];
   const overrides = new Map<number, Float32Array>();
@@ -109,7 +108,7 @@ export async function prepareGemmaPrompt(
     for (const id of ids) {
       if (id === placeholderId) {
         overrides.set(
-          tokens.length,
+          basePos + tokens.length,
           values.subarray(row * embeddingWidth, (row + 1) * embeddingWidth)
         );
         tokens.push(tokenizer.pad);
@@ -159,6 +158,36 @@ export async function prepareGemmaPrompt(
     return { hasContent, mediaType };
   };
 
+  return {
+    appendText,
+    emitContent,
+    finish: () => ({ tokenIds: tokens, overrides, mediaTokenCount }),
+  };
+}
+
+/**
+ * Preprocess mixed OpenAI-style content, encode each modality, and construct
+ * the exact Gemma turn protocol plus embedding overrides. Boundary tokens
+ * remain in the language sequence; repeated media placeholder IDs are
+ * replaced with projections matching the loaded text decoder's width.
+ */
+export async function prepareGemmaPrompt(
+  messages: ChatMessage[],
+  tokenizer: GemmaTokenizer,
+  model: GemmaModel,
+  options: {
+    thinking: boolean;
+    signal: AbortSignal;
+    tools?: FunctionToolDef[];
+    onStage?: (message: string) => void;
+  },
+): Promise<PreparedGemmaPrompt> {
+  const { thinking, signal } = options;
+  const onStage = options.onStage ?? (() => {});
+  const tools = options.tools ?? [];
+  const sanitize = (text: string) => tokenizer.sanitize(text);
+  const { appendText, emitContent, finish } = promptBuilder(tokenizer, model, signal, onStage);
+
   appendText("<bos>");
   const first = messages[0];
   const firstIsSystem = first?.role === "system";
@@ -173,6 +202,8 @@ export async function prepareGemmaPrompt(
 
   const rest = firstIsSystem ? messages.slice(1) : messages;
   let endType: "tool_call" | "tool_response" | GemmaMediaType | null = null;
+  let lastUserIdx = -1;
+  for (let i = 0; i < rest.length; i++) if (rest[i].role === "user") lastUserIdx = i;
 
   for (let i = 0; i < rest.length; i++) {
     const message = rest[i];
@@ -189,6 +220,20 @@ export async function prepareGemmaPrompt(
     }
     const continueModelTurn = role === "model" && prevNonTool?.role === "assistant";
     if (!continueModelTurn) appendText(`<|turn>${role}\n`);
+
+    // The checkpoint's chat template restores reasoning as a thought channel
+    // on in-flight tool exchanges (assistant tool calls after the last user
+    // turn). Without it, thinking-mode tool turns render out-of-distribution
+    // — a model turn that opens directly with <|tool_call> — and the model
+    // continues poorly after the tool response.
+    if (
+      message.role === "assistant" &&
+      message.tool_calls?.length &&
+      message.reasoning_content &&
+      i > lastUserIdx
+    ) {
+      appendText(`<|channel>thought\n${sanitize(message.reasoning_content)}\n<channel|>`);
+    }
 
     let prevType: "tool_call" | "tool_response" | GemmaMediaType | null = null;
     let toolResponsesOut = false;
@@ -219,5 +264,64 @@ export async function prepareGemmaPrompt(
   if (endType !== "tool_response" && endType !== "tool_call") {
     appendText("<|turn>model\n");
   }
-  return { tokenIds: tokens, overrides, mediaTokenCount };
+  return finish();
+}
+
+/**
+ * Continuation suffix for one new user turn on top of committed GPU state.
+ *
+ * The cache ends at the last generated content token — the sampled turn-end
+ * stop was never fed — so the suffix opens with the canonical `<turn|>\n`.
+ * The appendText segmentation deliberately mirrors `prepareGemmaPrompt` so
+ * both paths tokenize turn boundaries identically. Only this message's media
+ * is encoded; committed turns' media rows are already resident in the cache.
+ */
+export async function prepareGemmaUserTurnSuffix(
+  message: ChatMessage,
+  tokenizer: GemmaTokenizer,
+  model: GemmaModel,
+  options: {
+    signal: AbortSignal;
+    basePos: number;
+    onStage?: (message: string) => void;
+    /** False when the model turn is already open-ended in the cache — a user
+     * turn directly following tool responses, which the renderer (and the
+     * checkpoint's template) leave unclosed. Default true. */
+    closeTurn?: boolean;
+  },
+): Promise<PreparedGemmaPrompt> {
+  if (message.role !== "user") {
+    throw new Error("Gemma user-turn continuation requires a user message.");
+  }
+  const { appendText, emitContent, finish } = promptBuilder(
+    tokenizer, model, options.signal, options.onStage ?? (() => {}), options.basePos,
+  );
+  if (options.closeTurn ?? true) appendText("<turn|>\n");
+  appendText("<|turn>user\n");
+  await emitContent(message);
+  appendText("<turn|>\n");
+  appendText("<|turn>model\n");
+  return finish();
+}
+
+/**
+ * Continuation suffix feeding tool responses back into an open model turn.
+ *
+ * Matches the full renderer: responses follow the tool call directly and the
+ * model turn stays open (no turn markers). `pending: "tool-close"` prepends
+ * the `<tool_call|>` close tag when it was sampled as a stop token and never
+ * fed; a parallel-lookahead session already has it in the cache ("none").
+ */
+export function prepareGemmaToolResponsesSuffix(
+  responses: { name: string; content: string }[],
+  tokenizer: GemmaTokenizer,
+  options: { pending: "tool-close" | "none" },
+): PreparedGemmaPrompt {
+  const sanitize = (text: string) => tokenizer.sanitize(text);
+  const tokens: number[] = [];
+  if (options.pending === "tool-close") tokens.push(...tokenizer.encode("<tool_call|>"));
+  for (const response of responses) {
+    tokens.push(...tokenizer.encode(toolResponseText(response.name, response.content, sanitize)));
+  }
+  return { tokenIds: tokens, overrides: new Map(), mediaTokenCount: 0 };
 }

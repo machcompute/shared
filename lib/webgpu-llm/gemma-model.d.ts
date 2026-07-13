@@ -38,6 +38,7 @@ export declare class GemmaModel {
   spec: false;
   reset(): Promise<void>;
   resetPenaltyWindow(): void;
+  clearAllowedTokenIds(): void;
   notePenaltyToken(id: number): void;
   recentSet(): Set<number>;
   rewindDecode(count: number): void;

@@ -26,7 +26,7 @@ export type ChatContent = string | unknown[];
 
 export type ChatMessage =
   | { role: "system" | "user"; content: ChatContent }
-  | { role: "assistant"; content: string; tool_calls?: ToolCall[] }
+  | { role: "assistant"; content: string; tool_calls?: ToolCall[]; reasoning_content?: string }
   | { role: "tool"; content: string; tool_call_id?: string };
 
 type QwenChatMessage = ChatMessage & { content: string };
@@ -81,15 +81,69 @@ const clamp = (value: number, min: number, max: number) =>
 
 const randSeed = () => (Math.random() * 0x100000000) >>> 0;
 
-function messageSig(message: ChatMessage): string {
-  if (message.role === "assistant" && message.tool_calls?.length) {
-    return JSON.stringify([
-      "assistant",
-      message.content,
-      message.tool_calls.map((tc) => [tc.function.name, tc.function.arguments]),
-    ]);
+/** cyrb53-style string hash; committed records must stay small even when a
+ * message embeds multi-megabyte data-URL media parts. */
+function hashString(text: string): string {
+  let h1 = 0xdeadbeef ^ text.length;
+  let h2 = 0x41c6ce57 ^ text.length;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
   }
-  return JSON.stringify([message.role, message.content]);
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h2 >>> 0).toString(36) + "-" + (h1 >>> 0).toString(36);
+}
+
+function deepSortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(deepSortJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value as Record<string, unknown>)
+        .sort()
+        .map((key) => [key, deepSortJson((value as Record<string, unknown>)[key])])
+    );
+  }
+  return value;
+}
+
+/** Tool arguments as the renderer sees them: parsed and key-sorted, so a
+ * client re-serializing the same call does not invalidate the prefix. */
+function argsSig(argsJson: string): string {
+  try {
+    const parsed = JSON.parse(argsJson);
+    if (parsed && typeof parsed === "object") return JSON.stringify(deepSortJson(parsed));
+  } catch {
+    // Unparseable arguments participate verbatim.
+  }
+  return argsJson;
+}
+
+export function messageSig(message: ChatMessage): string {
+  // Normalization mirrors what the renderers actually emit — content is
+  // trimmed and tool arguments render with sorted keys — so only changes
+  // that would alter the rendered prompt invalidate the committed prefix.
+  const body =
+    message.role === "assistant" && message.tool_calls?.length
+      ? JSON.stringify([
+          "assistant",
+          (message.content ?? "").trim(),
+          message.tool_calls.map((tc) => [tc.function.name, argsSig(tc.function.arguments)]),
+        ])
+      : JSON.stringify([
+          message.role,
+          typeof message.content === "string" ? message.content.trim() : message.content,
+        ]);
+  // Long bodies (multimodal content arrays) hash down; any content change —
+  // including a swapped image — still invalidates the committed prefix.
+  return body.length > 256 ? `#${body.length}:${hashString(body)}` : body;
+}
+
+/** Everything besides the messages that renders into the prompt prefix; a
+ * change means the cached prefix is stale even when all sigs match. */
+export function promptPrefixKey(thinking: boolean, tools: FunctionToolDef[] | undefined): string {
+  return hashString(JSON.stringify({ thinking, tools: tools ?? null }));
 }
 
 export function validateMessages(input: unknown): ChatMessage[] {
@@ -127,7 +181,13 @@ export function validateMessages(input: unknown): ChatMessage[] {
     if (typeof content !== "string") {
       throw new Error(`messages[${i}].content must be a string for assistant messages`);
     }
-    if (m.tool_calls === undefined) return { role, content };
+    // Clients that echo reasoning back (DeepSeek-style reasoning_content) let
+    // the Gemma renderer restore the thought channel on in-flight tool turns.
+    const reasoning_content =
+      typeof (m as { reasoning_content?: unknown }).reasoning_content === "string"
+        ? ((m as { reasoning_content: string }).reasoning_content)
+        : undefined;
+    if (m.tool_calls === undefined) return { role, content, reasoning_content };
     if (!Array.isArray(m.tool_calls)) {
       throw new Error(`messages[${i}].tool_calls must be an array`);
     }
@@ -144,7 +204,7 @@ export function validateMessages(input: unknown): ChatMessage[] {
         function: { name: call.function.name, arguments: call.function.arguments },
       };
     });
-    return { role, content, tool_calls };
+    return { role, content, tool_calls, reasoning_content };
   });
   const last = messages[messages.length - 1];
   if (last.role !== "user" && last.role !== "tool") {
@@ -213,15 +273,18 @@ export async function runCompletion(
   const sanitize = (s: string) => tok.sanitize(s);
 
   const sigs = messages.map(messageSig);
+  const promptKey = promptPrefixKey(thinking, request.tools);
   const committed = engine.committed;
   engine.committed = null;
   const extra =
     committed &&
+    committed.model === engine.activeModelId &&
+    committed.promptKey === promptKey &&
     messages.length > committed.sigs.length &&
     committed.sigs.every((sig, i) => sig === sigs[i])
       ? messages.slice(committed.sigs.length)
       : null;
-  const closePrefix = committed?.closePending ? "</tool_call>" : "";
+  const closePrefix = committed?.pending === "tool-close" ? "</tool_call>" : "";
 
   let promptText: string;
   if (extra && extra.length === 1 && extra[0].role === "user") {
@@ -481,6 +544,8 @@ export async function runCompletion(
   const aborted = signal.aborted;
   if (!aborted) {
     engine.committed = {
+      model: engine.activeModelId,
+      promptKey,
       sigs: [
         ...sigs,
         messageSig({
@@ -490,7 +555,9 @@ export async function runCompletion(
         }),
       ],
       toolCallCount: toolCalls.length,
-      closePending,
+      // Qwen's suffix builders always open with <|im_end|>, so a normal end
+      // maps to "turn-close"; only an unfed </tool_call> needs the prefix.
+      pending: closePending ? "tool-close" : "turn-close",
     };
   }
 
