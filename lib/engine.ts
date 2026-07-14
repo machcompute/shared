@@ -114,7 +114,7 @@ function weightsVramBytes(weights: Record<string, unknown>): number {
   return total;
 }
 
-class Engine {
+export class Engine {
   private gpu: GPU | null = null;
   private loader: RuntimeLoader | null = null;
   private modelInstance: RuntimeModel | null = null;
@@ -308,31 +308,40 @@ class Engine {
 
     onProgress({ stage: "gpu", message: "Initializing WebGPU…", progress: null });
     let gpuError: string | null = null;
-    const gpu = await new GPU().init((message: string) => {
-      gpuError = message;
-    });
-    if (gpuError) throw new Error(gpuError);
+    const gpu = new GPU();
+    let loader: RuntimeLoader;
+    let model: RuntimeModel;
+    let vram: number;
+    try {
+      await gpu.init((message: string) => {
+        gpuError = message;
+      });
+      if (gpuError) throw new Error(gpuError);
 
-    this.loader = isGemmaModelId(target)
-      ? new GemmaLoader(gpu, (message: string, phase?: string, frac?: number | null) =>
-          onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
-        , gemmaConfig)
-      : new Loader(gpu, (message: string, phase?: string, frac?: number | null) =>
-          onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
-        );
-    const weights = await this.loader.load();
+      loader = isGemmaModelId(target)
+        ? new GemmaLoader(gpu, (message: string, phase?: string, frac?: number | null) =>
+            onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
+          , gemmaConfig)
+        : new Loader(gpu, (message: string, phase?: string, frac?: number | null) =>
+            onProgress({ stage: phase ?? "weights", message, progress: frac ?? null })
+          );
+      const weights = await loader.load();
 
-    onProgress({ stage: "pipelines", message: `Building ${profile.label} pipelines…`, progress: 1 });
-    const model = isGemmaModelId(target)
-      ? new GemmaModel(gpu, weights as GemmaWeightsMap, { maxCtx: resolved.maxContext, config: gemmaConfig })
-      : new Model(gpu, weights as WeightsMap, { maxCtx: resolved.maxContext });
-    model.BATCH = resolved.batchSize;
-    model.spec = !!model.hasMtp && resolved.mtp;
-    await model.reset();
-
-    const vram = weightsVramBytes(weights as Record<string, unknown>);
+      onProgress({ stage: "pipelines", message: `Building ${profile.label} pipelines…`, progress: 1 });
+      model = isGemmaModelId(target)
+        ? new GemmaModel(gpu, weights as GemmaWeightsMap, { maxCtx: resolved.maxContext, config: gemmaConfig })
+        : new Model(gpu, weights as WeightsMap, { maxCtx: resolved.maxContext });
+      model.BATCH = resolved.batchSize;
+      model.spec = !!model.hasMtp && resolved.mtp;
+      await model.reset();
+      vram = weightsVramBytes(weights as Record<string, unknown>);
+    } catch (error) {
+      gpu.destroy();
+      throw error;
+    }
 
     this.gpu = gpu;
+    this.loader = loader;
     this.tokInstance = tok;
     this.modelInstance = model;
     this.activeModel = target;
@@ -351,6 +360,24 @@ class Engine {
       this.modelInstance.BATCH = Math.round(clamp(options.batchSize, 1, 8));
     }
     this.modelInstance.spec = !!this.modelInstance.hasMtp && this.mtpEnabled;
+  }
+
+  unload(): void {
+    if (this.generating) {
+      throw new Error("Cannot unload the model while a response is generating.");
+    }
+    if (this.loadPromise) {
+      throw new Error("Cannot unload the model while it is loading.");
+    }
+
+    this.gpu?.destroy();
+    this.gpu = null;
+    this.loader = null;
+    this.modelInstance = null;
+    this.tokInstance = null;
+    this.deviceInfo = null;
+    this.mtpEnabled = false;
+    this.committed = null;
   }
 
   async wipeCache(options: { model?: ModelId } = {}): Promise<void> {

@@ -2,6 +2,7 @@ import type { GPU } from './gpu.js';
 import type { GemmaWeightsMap } from './gemma-loader.js';
 import type { GemmaConfig } from './gemma-config.js';
 import type { GemmaAudioInput, GemmaVideoInput, GemmaVisionInput } from './gemma-media';
+import type { TokenMask } from './tool-constraint';
 
 export interface GemmaCandidates {
   ids: Uint32Array;
@@ -15,7 +16,7 @@ export interface GemmaDecodeParams {
   presencePenalty?: number;
   eosId?: number;
   stopIds?: number[];
-  allowedTokenIds?: Uint32Array;
+  tokenMask?: TokenMask;
 }
 
 export interface GemmaDecodeBatchResult {
@@ -41,13 +42,13 @@ export declare class GemmaModel {
   clearAllowedTokenIds(): void;
   notePenaltyToken(id: number): void;
   recentSet(): Set<number>;
-  rewindDecode(count: number): void;
+  rewindDecode(count: number, sampledCount?: number): void;
   prefill(
     tokenIds: number[] | Uint32Array,
     onProgress?: (done: number, total: number) => void,
     overrides?: Map<number, Float32Array> | null,
   ): Promise<GemmaCandidates>;
-  decode(tokenId: number): Promise<GemmaCandidates>;
+  decode(tokenId: number, params?: GemmaDecodeParams): Promise<GemmaCandidates>;
   decodeBatch(tokenId: number, k: number, params?: GemmaDecodeParams): Promise<GemmaDecodeBatchResult>;
   encodeImage(input: GemmaVisionInput): Promise<Float32Array>;
   encodeVideo(input: GemmaVideoInput): Promise<Float32Array>;

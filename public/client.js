@@ -104,6 +104,10 @@ export class MachLLM {
     return this.#request("load", options);
   }
 
+  unload() {
+    return this.#request("unload");
+  }
+
   updateSettings(options) {
     return this.#request("settings.update", options);
   }

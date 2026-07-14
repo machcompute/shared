@@ -61,6 +61,12 @@ export function attachProtocol(win: Window): () => void {
           reply("result", await engine.status());
           break;
         }
+        case "unload": {
+          if (busy) throw Object.assign(new Error("The engine is busy."), { code: "busy" });
+          engine.unload();
+          reply("result", await engine.status());
+          break;
+        }
         case "settings.update": {
           engine.updateRuntime((params ?? {}) as { batchSize?: number; mtp?: boolean });
           reply("result", await engine.status());

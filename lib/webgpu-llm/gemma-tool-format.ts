@@ -1,6 +1,38 @@
 const QUOTE = '<|"|>';
+const BARE_NAME_RE = /^[A-Za-z_][\w.-]*$/;
+const RESERVED = [
+  QUOTE,
+  "<|tool>",
+  "<tool|>",
+  "<|tool_call>",
+  "<tool_call|>",
+  "<|tool_response>",
+  "<tool_response|>",
+];
 
 type Json = unknown;
+
+function safeText(value: unknown): string {
+  let text = String(value ?? "");
+  // Gemma's sentinel-delimited strings have no native escape syntax. Render
+  // the leading angle bracket as a visible Unicode escape so user/tool text
+  // cannot terminate a declaration, call, or response block.
+  for (const marker of RESERVED) {
+    text = text.replaceAll(marker, `\\u003c${marker.slice(1)}`);
+  }
+  return text;
+}
+
+function quoted(value: unknown): string {
+  return QUOTE + safeText(value) + QUOTE;
+}
+
+function bareName(value: string, label = "property name"): string {
+  if (!BARE_NAME_RE.test(value)) {
+    throw new Error(`${label} cannot be serialized in Gemma tool syntax: ${value}`);
+  }
+  return value;
+}
 
 function sortedKeys(obj: Record<string, unknown>): string[] {
   return Object.keys(obj).sort((a, b) => {
@@ -11,7 +43,7 @@ function sortedKeys(obj: Record<string, unknown>): string[] {
 }
 
 export function formatArgument(value: Json, escapeKeys: boolean): string {
-  if (typeof value === "string") return QUOTE + value + QUOTE;
+  if (typeof value === "string") return quoted(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (value === null || value === undefined) return "";
   if (Array.isArray(value)) {
@@ -22,7 +54,7 @@ export function formatArgument(value: Json, escapeKeys: boolean): string {
     return (
       "{" +
       sortedKeys(obj)
-        .map((key) => (escapeKeys ? QUOTE + key + QUOTE : key) + ":" + formatArgument(obj[key], escapeKeys))
+        .map((key) => (escapeKeys ? quoted(key) : bareName(key)) + ":" + formatArgument(obj[key], escapeKeys))
         .join(",") +
       "}"
     );
@@ -35,7 +67,15 @@ function upper(value: unknown): string {
 }
 
 function quotedList(items: unknown[]): string {
-  return "[" + items.map((item) => QUOTE + String(item) + QUOTE).join(",") + "]";
+  return "[" + items.map(quoted).join(",") + "]";
+}
+
+function formatType(value: unknown): string {
+  if (typeof value === "string") return quoted(upper(value));
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return formatArgument(value.map(upper), true);
+  }
+  throw new Error("Gemma tool schema type must be a string or an array of strings");
 }
 
 function formatParameters(
@@ -48,13 +88,13 @@ function formatParameters(
     if (filterKeys && standardKeys.includes(key)) continue;
     const value = (properties[key] ?? {}) as Record<string, unknown>;
     const inner: string[] = [];
-    const type = upper(value["type"]);
+    const rawType = value["type"];
+    const types = (Array.isArray(rawType) ? rawType : [rawType]).map(upper);
 
-    if (value["description"]) inner.push("description:" + QUOTE + value["description"] + QUOTE);
+    if (value["description"]) inner.push("description:" + quoted(value["description"]));
 
-    if (type === "STRING") {
-      if (value["enum"]) inner.push("enum:" + formatArgument(value["enum"], true));
-    } else if (type === "ARRAY") {
+    if (value["enum"]) inner.push("enum:" + formatArgument(value["enum"], true));
+    if (types.includes("ARRAY") || value["items"] !== undefined) {
       const items = value["items"];
       if (items && typeof items === "object" && !Array.isArray(items)) {
         const itemsObj = items as Record<string, unknown>;
@@ -67,12 +107,7 @@ function formatParameters(
           } else if (itemKey === "required" && Array.isArray(itemValue)) {
             itemsInner.push("required:" + quotedList(itemValue));
           } else if (itemKey === "type") {
-            itemsInner.push(
-              "type:" +
-                (typeof itemValue === "string"
-                  ? formatArgument(upper(itemValue), true)
-                  : formatArgument((itemValue as unknown[]).map(upper), true))
-            );
+            itemsInner.push("type:" + formatType(itemValue));
           } else {
             itemsInner.push(itemKey + ":" + formatArgument(itemValue, true));
           }
@@ -83,7 +118,7 @@ function formatParameters(
 
     if (value["nullable"]) inner.push("nullable:true");
 
-    if (type === "OBJECT") {
+    if (types.includes("OBJECT") || value["properties"] !== undefined) {
       const props = value["properties"];
       if (props && typeof props === "object" && !Array.isArray(props)) {
         inner.push("properties:{" + formatParameters(props as Record<string, unknown>) + "}");
@@ -91,8 +126,8 @@ function formatParameters(
       if (Array.isArray(value["required"])) inner.push("required:" + quotedList(value["required"] as unknown[]));
     }
 
-    inner.push("type:" + QUOTE + type + QUOTE);
-    out.push(key + ":{" + inner.join(",") + "}");
+    if (rawType !== undefined) inner.push("type:" + formatType(rawType));
+    out.push(bareName(key) + ":{" + inner.join(",") + "}");
   }
   return out.join(",");
 }
@@ -103,16 +138,17 @@ export interface ToolFunctionDef {
 
 export function formatToolDeclaration(tool: ToolFunctionDef): string {
   const fn = tool.function;
-  let out = "declaration:" + fn.name + "{description:" + QUOTE + (fn.description ?? "") + QUOTE;
+  let out = "declaration:" + bareName(fn.name, "tool function name") + "{description:" + quoted(fn.description ?? "");
   const params = fn.parameters;
   if (params) {
-    out += ",parameters:{";
+    const fields: string[] = [];
     const props = params["properties"];
-    if (props && typeof props === "object") {
-      out += "properties:{" + formatParameters(props as Record<string, unknown>) + "},";
+    if (props && typeof props === "object" && !Array.isArray(props)) {
+      fields.push("properties:{" + formatParameters(props as Record<string, unknown>) + "}");
     }
-    if (Array.isArray(params["required"])) out += "required:" + quotedList(params["required"] as unknown[]) + ",";
-    if (params["type"]) out += "type:" + QUOTE + upper(params["type"]) + QUOTE + "}";
+    if (Array.isArray(params["required"])) fields.push("required:" + quotedList(params["required"] as unknown[]));
+    if (params["type"] !== undefined) fields.push("type:" + formatType(params["type"]));
+    out += ",parameters:{" + fields.join(",") + "}";
   }
   out += "}";
   return out;
@@ -120,13 +156,13 @@ export function formatToolDeclaration(tool: ToolFunctionDef): string {
 
 export function formatToolCall(name: string, args: Record<string, unknown>): string {
   const body = sortedKeys(args)
-    .map((key) => key + ":" + formatArgument(args[key], false))
+    .map((key) => bareName(key) + ":" + formatArgument(args[key], false))
     .join(",");
-  return "<|tool_call>call:" + name + "{" + body + "}<tool_call|>";
+  return "<|tool_call>call:" + bareName(name, "tool function name") + "{" + body + "}<tool_call|>";
 }
 
 export function formatToolResponse(name: string, content: string): string {
-  return "<|tool_response>response:" + name + "{value:" + formatArgument(content, false) + "}<tool_response|>";
+  return "<|tool_response>response:" + bareName(name, "tool function name") + "{value:" + formatArgument(content, false) + "}<tool_response|>";
 }
 
 /** Parse one Gemma-format value (string/number/word/object/array) in

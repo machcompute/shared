@@ -10,7 +10,8 @@ import { ToolCallStreamParser } from "./webgpu-llm/tool-call-parser";
 import { sample } from "./webgpu-llm/tokenizer.js";
 import { isGemmaModelId, type ModelId } from "./webgpu-llm/model-registry";
 import { runGemmaCompletion } from "./gemma-completions";
-import { ToolConstraint } from "./webgpu-llm/tool-constraint";
+import { canCommitCompletionPrefix, qwenDecodeBatchSize } from "./completion-policy";
+import { ToolConstraint, validateTools } from "./webgpu-llm/tool-constraint";
 import { parseToolCallBody } from "./webgpu-llm/tool-call-parser";
 
 export interface ToolCall {
@@ -258,6 +259,7 @@ export async function runCompletion(
     return runGemmaCompletion(request, signal, emitDelta, emitProgress);
   }
   const messages = validateMessages(request.messages);
+  validateTools(request.tools, { grammar: "qwen" });
   assertQwenTextMessages(messages);
   const model = engine.qwenModel;
   const tok = engine.qwenTok;
@@ -422,10 +424,17 @@ export async function runCompletion(
       if (toolParser.isComplete) break;
 
       const constrained = !!constraint && toolParser.isOpen;
-      const k = Math.min(constrained ? 1 : model.BATCH, maxNew - totalN, model.maxCtx - model.pos - 1);
+      // Qwen's recurrent state cannot rewind an unconstrained batch if a
+      // tool opener appears in its middle. Requests with tools therefore
+      // decode one token at a time, including while the parser is idle.
+      const k = Math.min(
+        qwenDecodeBatchSize(!!constraint, model.BATCH),
+        maxNew - totalN,
+        model.maxCtx - model.pos - 1,
+      );
       if (k < 1) break;
 
-      if (!constrained && model.spec && model.hasMtp && k >= 3) {
+      if (!constraint && model.spec && model.hasMtp && k >= 3) {
         const maxSpecRounds = (model as unknown as { R?: number }).R ?? 1;
         const r = await model.specChain(
           next,
@@ -542,7 +551,11 @@ export async function runCompletion(
 
   const finalToolCalls = toolCalls.length ? toolCalls : null;
   const aborted = signal.aborted;
-  if (!aborted) {
+  if (canCommitCompletionPrefix({
+    aborted,
+    stopped: hitEos,
+    hasToolCalls: finalToolCalls !== null,
+  })) {
     engine.committed = {
       model: engine.activeModelId,
       promptKey,

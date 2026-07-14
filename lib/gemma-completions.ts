@@ -1,4 +1,5 @@
 import { engine, type ProgressEvent } from "./engine";
+import { canCommitCompletionPrefix } from "./completion-policy";
 import {
   messageSig,
   promptPrefixKey,
@@ -16,7 +17,7 @@ import {
   type PreparedGemmaPrompt,
 } from "./gemma-processor";
 import { GemmaToolCallParser, parseGemmaToolCallBody } from "./webgpu-llm/gemma-tool-parser";
-import { ToolConstraint } from "./webgpu-llm/tool-constraint";
+import { ToolConstraint, validateTools } from "./webgpu-llm/tool-constraint";
 import { sample } from "./webgpu-llm/tokenizer.js";
 
 const clamp = (value: number, min: number, max: number) =>
@@ -91,6 +92,7 @@ export async function runGemmaCompletion(
   emitProgress: (event: ProgressEvent) => void,
 ): Promise<CompletionResult> {
   const messages = validateMessages(request.messages);
+  validateTools(request.tools, { grammar: "gemma" });
   const model = engine.gemmaModel;
   const tok = engine.gemmaTok;
   const thinking = request.thinking ?? true;
@@ -311,16 +313,18 @@ export async function runGemmaCompletion(
       nextConsumed = false;
       if (toolParser.isComplete) break;
       if (total >= maxNew || model.pos >= model.maxCtx - 1) break;
-      const allowedTokenIds = constraint && toolParser.isOpen
-        ? constraint.allowed(toolParser.rawBuffer, parseGemmaToolCallBody)
+      const tokenMask = constraint && toolParser.isOpen
+        ? constraint.mask(toolParser.rawBuffer, parseGemmaToolCallBody)
         : undefined;
-      if (allowedTokenIds && !allowedTokenIds.length) throw new Error("Tool call cannot satisfy the declared schema.");
+      if (tokenMask?.kind === "allow" && !tokenMask.tokenIds.length) {
+        throw new Error("Tool call cannot satisfy the declared schema.");
+      }
       const k = Math.min(
         toolParser.isOpen ? 1 : model.BATCH,
         maxNew - total,
         model.maxCtx - model.pos,
       );
-      const result = await model.decodeBatch(next, k, { ...sampling, stopIds, eosId: tok.eos, allowedTokenIds });
+      const result = await model.decodeBatch(next, k, { ...sampling, stopIds, eosId: tok.eos, tokenMask });
       for (let i = 0; i < result.ids.length; i++) {
         const id = result.ids[i];
         const last = i === result.ids.length - 1;
@@ -333,7 +337,8 @@ export async function runGemmaCompletion(
         total++;
         if (toolParser.isOpen || toolParser.isComplete || total >= maxNew) {
           const unused = result.ids.length - i - 1;
-          model.rewindDecode(unused);
+          // A stopped batch's final id never entered the penalty window.
+          model.rewindDecode(unused, unused - (result.stopped ? 1 : 0));
           next = id;
           nextConsumed = true;
           break;
@@ -381,7 +386,11 @@ export async function runGemmaCompletion(
   // Commit only clean stops: a length-capped turn leaves its final sampled
   // token consumed into `content` but never fed, so the cache would diverge
   // from the assistant message the client echoes back.
-  if (stopped && !signal.aborted) {
+  if (canCommitCompletionPrefix({
+    aborted: signal.aborted,
+    stopped,
+    hasToolCalls: finalToolCalls !== null,
+  })) {
     engine.committed = {
       model: engine.activeModelId,
       promptKey,

@@ -79,6 +79,8 @@ The cache probe does not load a model or download weights.
 
 `llm.load(options?)` — optional explicit preload; `{ model?, maxContext?, batchSize?, mtp?, reload? }`. Loading Gemma uses `batchSize: 1` and a practical default 8k context; a larger context can be requested explicitly up to 131,072 tokens, subject to GPU memory.
 
+`llm.unload()` — releases the loaded model and its WebGPU device while preserving the browser weights cache. It rejects while a completion or model load is in progress.
+
 `llm.updateSettings(options?)` — applies `{ batchSize?, mtp? }` to a loaded model without reloading (`maxContext` requires a reload).
 
 `llm.wipeCache({ model? })` — deletes the active model's OPFS weights cache, or the named registered model's cache.
@@ -103,6 +105,17 @@ The allowlist comes from `NEXT_PUBLIC_ALLOWED_DOMAINS` (required, no default —
 npm run dev   # engine on http://localhost:3001 (port is pinned; the OPFS dev cache lives under this origin)
 ```
 
+### Benchmark dashboard
+
+The standalone dashboard in `bench/` is plain HTML, CSS, and JavaScript. Run the engine and static server in separate terminals:
+
+```sh
+npm run dev
+npm run bench
+```
+
+Then open `http://localhost:4173/bench/`. All three registered models are selected by default and run sequentially as load → warmup/benchmark → unload. The page exposes prompt length, output length, warmup, repetitions, context, batch size, and Qwen MTP controls, and can copy or download the combined JSON report.
+
 For an isolated Gemma/WebGPU test server without disturbing a port-3001 session:
 
 ```sh
@@ -117,4 +130,4 @@ Launch Chrome with Vulkan and Unsafe WebGPU enabled when your Linux setup needs 
 
 ## Protocol (for non-JS clients)
 
-Requests to the iframe: `{ ns: "mach-llm", id, method, params }` with methods `ping`, `status`, `models.list`, `load`, `chat.completions.create`, `abort` (`{ targetId }`), `settings.update`, `cache.wipe`. Replies: `{ ns, id, type: "chunk" | "result" | "error", data }`; `models.list` replies with `{ object: "list", data: Model[] }`, including the per-model `cached` value described above. Chunks are `{ event: "progress", progress }` or `{ event: "chunk", chunk }`. On boot the engine broadcasts `{ ns, type: "ready", version, model }` to its parent.
+Requests to the iframe: `{ ns: "mach-llm", id, method, params }` with methods `ping`, `status`, `models.list`, `load`, `unload`, `chat.completions.create`, `abort` (`{ targetId }`), `settings.update`, `cache.wipe`. Replies: `{ ns, id, type: "chunk" | "result" | "error", data }`; `models.list` replies with `{ object: "list", data: Model[] }`, including the per-model `cached` value described above. Chunks are `{ event: "progress", progress }` or `{ event: "chunk", chunk }`. On boot the engine broadcasts `{ ns, type: "ready", version, model }` to its parent.

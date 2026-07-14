@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="A local WebGPU benchmark dashboard for Mach LLM models.">
+    <title>Mach Model Lab</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="page-glow" aria-hidden="true"></div>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Mach Model Lab home">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span>Mach <b>Model Lab</b></span>
+      </a>
+      <div id="connection-pill" class="connection-pill" data-state="idle">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span id="connection-label">Engine offline</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow"><span>WebGPU</span> / local inference benchmark</p>
+          <h1>Three models.<br><em>One clean run.</em></h1>
+          <p class="hero-description">
+            Load, measure, and release each model in sequence. Compare real prefill and decode
+            performance on the GPU in this browser—without sending prompts anywhere.
+          </p>
+        </div>
+        <div class="hero-readout" aria-label="Benchmark sequence">
+          <div class="sequence-step">
+            <span class="sequence-number">01</span>
+            <span><b>Load</b><small>Weights → GPU</small></span>
+          </div>
+          <span class="sequence-line" aria-hidden="true"></span>
+          <div class="sequence-step">
+            <span class="sequence-number">02</span>
+            <span><b>Bench</b><small>Prefill + decode</small></span>
+          </div>
+          <span class="sequence-line" aria-hidden="true"></span>
+          <div class="sequence-step">
+            <span class="sequence-number">03</span>
+            <span><b>Unload</b><small>Release VRAM</small></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace" aria-labelledby="setup-title">
+        <form id="benchmark-form" class="panel config-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">Run setup</p>
+              <h2 id="setup-title">Benchmark configuration</h2>
+            </div>
+            <button id="restore-button" class="text-button" type="button">Restore defaults</button>
+          </div>
+
+          <div class="engine-row">
+            <label class="field field-wide" for="engine-url">
+              <span>Engine URL</span>
+              <span class="input-with-icon">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.6 13.4a2 2 0 0 0 2.8 0l3-3a2 2 0 1 0-2.8-2.8l-1 1m.8 6.8-1 1a2 2 0 0 1-2.8-2.8l3-3a2 2 0 0 1 2.8 0"/></svg>
+                <input id="engine-url" name="engineUrl" type="url" value="http://localhost:3001" spellcheck="false" required>
+              </span>
+            </label>
+            <button id="connect-button" class="secondary-button connect-button" type="button">
+              <span>Connect</span>
+            </button>
+          </div>
+
+          <div class="field-grid">
+            <label class="field" for="prompt-seed">
+              <span>Repeated text</span>
+              <input id="prompt-seed" name="promptSeed" type="text" value="test" maxlength="80" required>
+              <small>The predictable token used to build the prompt.</small>
+            </label>
+            <label class="field" for="prompt-repeats">
+              <span>Prompt repetitions</span>
+              <input id="prompt-repeats" name="promptRepeats" type="number" value="4000" min="1" max="100000" step="1" required>
+              <small>Exact prompt tokens are reported after each run.</small>
+            </label>
+            <label class="field" for="output-tokens">
+              <span>Output tokens</span>
+              <input id="output-tokens" name="maxTokens" type="number" value="256" min="2" max="4096" step="1" required>
+              <small>Decode TPS excludes the first generated token.</small>
+            </label>
+            <label class="field" for="warmup-tokens">
+              <span>Warmup tokens</span>
+              <input id="warmup-tokens" name="warmupTokens" type="number" value="16" min="0" max="256" step="1" required>
+              <small>Runs once after loading and is not measured.</small>
+            </label>
+            <label class="field" for="runs-per-model">
+              <span>Runs per model</span>
+              <input id="runs-per-model" name="runs" type="number" value="1" min="1" max="10" step="1" required>
+              <small>Multiple runs report the median.</small>
+            </label>
+          </div>
+
+          <div class="config-note">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8v.01"/></svg>
+            <span>Large Gemma contexts allocate a KV cache for every decoder layer. Start at 8K unless your GPU has ample memory.</span>
+          </div>
+        </form>
+
+        <aside class="panel run-panel" aria-labelledby="run-title">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-kicker">Run control</p>
+              <h2 id="run-title">Ready when you are</h2>
+            </div>
+          </div>
+
+          <div class="run-status" aria-live="polite">
+            <div class="run-orbit" aria-hidden="true">
+              <span class="orbit-ring"></span>
+              <span class="orbit-core">GPU</span>
+            </div>
+            <div>
+              <strong id="run-status-title">Waiting to start</strong>
+              <p id="run-status-detail">Connect to the engine, then run the selected queue.</p>
+            </div>
+          </div>
+
+          <div class="overall-progress" aria-label="Overall benchmark progress">
+            <div class="progress-labels">
+              <span>Overall progress</span>
+              <span id="overall-progress-label">0 / 3</span>
+            </div>
+            <div class="progress-track"><span id="overall-progress-bar"></span></div>
+          </div>
+
+          <div class="run-actions">
+            <button id="run-button" class="primary-button" type="submit" form="benchmark-form">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7V5Z"/></svg>
+              <span>Run selected models</span>
+            </button>
+            <button id="stop-button" class="danger-button" type="button" disabled>
+              <span class="stop-icon" aria-hidden="true"></span>
+              <span>Stop</span>
+            </button>
+          </div>
+          <p class="run-footnote">Stopping during model load takes effect as soon as loading finishes.</p>
+        </aside>
+      </section>
+
+      <section class="models-section" aria-labelledby="models-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Execution queue</p>
+            <h2 id="models-title">Choose models</h2>
+          </div>
+          <p>Drag-free by design: models run top to bottom, one GPU runtime at a time.</p>
+        </div>
+        <div id="model-list" class="model-list"></div>
+      </section>
+
+      <section id="results-section" class="results-section" aria-labelledby="results-title">
+        <div class="section-heading results-heading">
+          <div>
+            <p class="section-kicker">Performance report</p>
+            <h2 id="results-title">Results</h2>
+          </div>
+          <div class="result-actions">
+            <button id="copy-button" class="secondary-button small" type="button" disabled>Copy JSON</button>
+            <button id="download-button" class="secondary-button small" type="button" disabled>Download</button>
+          </div>
+        </div>
+
+        <div id="metric-grid" class="metric-grid" aria-live="polite">
+          <article class="metric-card empty"><span>Completed</span><strong>—</strong><small>models</small></article>
+          <article class="metric-card empty"><span>Fastest decode</span><strong>—</strong><small>tokens / second</small></article>
+          <article class="metric-card empty"><span>Elapsed</span><strong>—</strong><small>wall clock</small></article>
+          <article class="metric-card empty"><span>Adapter</span><strong>—</strong><small>WebGPU device</small></article>
+        </div>
+
+        <div class="results-layout">
+          <div class="panel table-panel">
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Status</th>
+                    <th>Load</th>
+                    <th>Prompt</th>
+                    <th>Prefill</th>
+                    <th>Decode</th>
+                    <th>Latency</th>
+                    <th>Weights</th>
+                  </tr>
+                </thead>
+                <tbody id="results-body">
+                  <tr class="empty-row"><td colspan="8">Results will appear here as each model finishes.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel chart-panel">
+            <div class="chart-heading">
+              <div>
+                <span class="chart-title">Decode throughput</span>
+                <small>Median visible tokens / second</small>
+              </div>
+              <span class="live-badge"><i></i> measured</span>
+            </div>
+            <div id="throughput-chart" class="throughput-chart">
+              <div class="chart-empty">Run the queue to compare models.</div>
+            </div>
+          </div>
+        </div>
+
+        <details class="raw-results">
+          <summary>Raw benchmark JSON</summary>
+          <pre id="raw-output">No benchmark data yet.</pre>
+        </details>
+      </section>
+
+      <section class="log-section" aria-labelledby="log-title">
+        <details>
+          <summary id="log-title">Activity log <span id="log-count">0 events</span></summary>
+          <ol id="activity-log" class="activity-log"></ol>
+        </details>
+      </section>
+    </main>
+
+    <footer>
+      <span>Mach Model Lab</span>
+      <span>Runs locally with WebGPU</span>
+    </footer>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <noscript>This benchmark requires JavaScript.</noscript>
+    <script type="module" src="./benchmark.js"></script>
+  </body>
+</html>
