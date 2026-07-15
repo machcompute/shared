@@ -75,9 +75,9 @@ The cache probe does not load a model or download weights.
 - `finish_reason` — `"stop"` (EOS), `"length"` (hit `max_tokens` or the context window), `"abort"`.
 - `usage.prompt_tokens` counts the tokens actually prefilled: on a continuation turn (see below) that is just the new suffix, not the whole conversation.
 
-`llm.status()` → `{ model, activeModel, defaultModel, availableModels, modalities, webgpu, adapter, cached, loaded, generating, hasMtp, contextUsedTokens, contextMaxTokens, device }` — reports runtime state for the active model. In particular, `status.cached` applies only to `status.activeModel`; use `llm.models.list()` for per-model cache status. `webgpu` says the API exists, while `adapter` says a usable GPU adapter was actually found; gate any "Load model" UI on both.
+`llm.status()` → `{ model, activeModel, defaultModel, availableModels, modalities, webgpu, adapter, cached, loaded, generating, hasMtp, batchSize, prefillChunk, contextUsedTokens, contextMaxTokens, device }` — reports runtime state for the active model. In particular, `status.cached` applies only to `status.activeModel`; use `llm.models.list()` for per-model cache status. `webgpu` says the API exists, while `adapter` says a usable GPU adapter was actually found; gate any "Load model" UI on both. Loaded-device details also report subgroup support and fixed subgroup bounds when the browser exposes them.
 
-`llm.load(options?)` — optional explicit preload; `{ model?, maxContext?, batchSize?, mtp?, reload? }`. Loading Gemma uses `batchSize: 1` and a practical default 8k context; a larger context can be requested explicitly up to 131,072 tokens, subject to GPU memory.
+`llm.load(options?)` — optional explicit preload; `{ model?, maxContext?, batchSize?, prefillChunk?, mtp?, reload? }`. Gemma uses a practical default 8k context; a larger context can be requested explicitly up to 131,072 tokens, subject to GPU memory. `prefillChunk` controls prompt rows per GPU submission and is rounded to a 32-row tile between 32 and 256 (defaults: Qwen 256, Gemma E4B 64, Gemma E2B 128).
 
 `llm.unload()` — releases the loaded model and its WebGPU device while preserving the browser weights cache. It rejects while a completion or model load is in progress.
 
@@ -114,7 +114,7 @@ npm run dev
 npm run bench
 ```
 
-Then open `http://localhost:4173/bench/`. All three registered models are selected by default and run sequentially as load → warmup/benchmark → unload. The page exposes prompt length, output length, warmup, repetitions, context, batch size, and Qwen MTP controls, and can copy or download the combined JSON report.
+Then open `http://localhost:4173/bench/`. All three registered models are selected by default and run sequentially as load → warmup/benchmark → unload. The page exposes prompt length, output length, warmup, repetitions, context, batch size, prefill chunk size, and Qwen MTP controls, and can copy or download the combined JSON report.
 
 For an isolated Gemma/WebGPU test server without disturbing a port-3001 session:
 

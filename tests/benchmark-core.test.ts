@@ -19,8 +19,8 @@ describe("benchmark configuration", () => {
       warmupTokens: "8",
       runs: "3",
       models: [
-        { id: "a", label: "A", selected: true, maxContext: "4096", contextLimit: 8192, batchSize: "4", mtp: true },
-        { id: "b", label: "B", selected: false, maxContext: "4096", contextLimit: 8192, batchSize: "4" },
+        { id: "a", label: "A", selected: true, maxContext: "4096", contextLimit: 8192, batchSize: "4", prefillChunk: "64", mtp: true },
+        { id: "b", label: "B", selected: false, maxContext: "4096", contextLimit: 8192, batchSize: "4", prefillChunk: "64" },
       ],
     })).toEqual({
       promptSeed: "test",
@@ -28,7 +28,7 @@ describe("benchmark configuration", () => {
       maxTokens: 128,
       warmupTokens: 8,
       runs: 3,
-      models: [{ id: "a", label: "A", maxContext: 4096, batchSize: 4, mtp: true }],
+      models: [{ id: "a", label: "A", maxContext: 4096, batchSize: 4, prefillChunk: 64, mtp: true }],
     });
   });
 
@@ -39,8 +39,19 @@ describe("benchmark configuration", () => {
       maxTokens: 256,
       warmupTokens: 0,
       runs: 1,
-      models: [{ id: "a", label: "A", selected: true, maxContext: 4096, contextLimit: 8192, batchSize: 4 }],
+      models: [{ id: "a", label: "A", selected: true, maxContext: 4096, contextLimit: 8192, batchSize: 4, prefillChunk: 64 }],
     })).toThrow("needs a context above");
+  });
+
+  it("requires prefill chunks to align to the 32-row GEMM tile", () => {
+    expect(() => normalizeConfig({
+      promptSeed: "test",
+      promptRepeats: 1000,
+      maxTokens: 128,
+      warmupTokens: 0,
+      runs: 1,
+      models: [{ id: "a", label: "A", selected: true, maxContext: 4096, contextLimit: 8192, batchSize: 4, prefillChunk: 48 }],
+    })).toThrow("multiple of 32");
   });
 
   it("builds the deterministic repeated-token prompt", () => {

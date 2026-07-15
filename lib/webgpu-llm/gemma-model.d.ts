@@ -27,6 +27,12 @@ export interface GemmaDecodeBatchResult {
   stopId: number | null;
 }
 
+export declare function gemmaAttentionChunkRange(
+  basePos: number,
+  rows: number,
+  window?: number,
+): { base: number; count: number };
+
 /** Gemma's Q4 text decoder with independent FP8 E4M3FN KV caches. */
 export declare class GemmaModel {
   constructor(gpu: GPU, weights: GemmaWeightsMap, opts?: { maxCtx?: number; chunk?: number; config?: GemmaConfig });
@@ -34,6 +40,7 @@ export declare class GemmaModel {
   maxCtx: number;
   /** Width of text and projected media embeddings for the loaded checkpoint. */
   embeddingWidth: number;
+  chunk: number;
   BATCH: number;
   hasMtp: false;
   spec: false;

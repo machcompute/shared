@@ -6,6 +6,7 @@ const controls = vi.hoisted(() => ({
   loaderLoad: vi.fn(),
   tokenizerLoad: vi.fn(),
   modelReset: vi.fn(),
+  modelConstruct: vi.fn(),
 }));
 
 vi.mock("../lib/webgpu-llm/gpu.js", () => ({
@@ -48,6 +49,11 @@ vi.mock("../lib/webgpu-llm/model.js", () => ({
     spec = false;
     pos = 0;
     maxCtx = 1024;
+    chunk = 256;
+    constructor(_gpu: unknown, _weights: unknown, options: { chunk?: number }) {
+      this.chunk = options.chunk ?? 256;
+      controls.modelConstruct(options);
+    }
     reset() {
       return controls.modelReset();
     }
@@ -65,6 +71,7 @@ describe("Engine model-load cleanup", () => {
     controls.loaderLoad.mockReset().mockResolvedValue({});
     controls.tokenizerLoad.mockReset().mockResolvedValue({});
     controls.modelReset.mockReset().mockResolvedValue(undefined);
+    controls.modelConstruct.mockReset();
   });
 
   it("destroys a partially initialized GPU when device initialization fails", async () => {
@@ -96,6 +103,14 @@ describe("Engine model-load cleanup", () => {
     await engine.ensureLoaded({ model: QWEN_MODEL_ID }, () => {});
     expect(engine.ready).toBe(true);
     expect(controls.gpuDestroy).not.toHaveBeenCalled();
+  });
+
+  it("normalizes prefill chunks to the 32-row kernel tile", async () => {
+    const engine = new Engine();
+    await engine.ensureLoaded({ model: QWEN_MODEL_ID, prefillChunk: 70 }, () => {});
+
+    expect(controls.modelConstruct).toHaveBeenCalledWith(expect.objectContaining({ chunk: 64 }));
+    await expect(engine.status()).resolves.toMatchObject({ prefillChunk: 64 });
   });
 
   it("unloads a ready model and releases its GPU", async () => {

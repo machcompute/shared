@@ -43,9 +43,10 @@ export interface SpecChainResult {
 }
 
 export declare class Model {
-  constructor(gpu: GPU, weights: WeightsMap, opts: { maxCtx: number });
+  constructor(gpu: GPU, weights: WeightsMap, opts: { maxCtx: number; chunk?: number });
   pos: number;
   maxCtx: number;
+  chunk: number;
   hasMtp: boolean;
   spec: boolean;
   BATCH: number;

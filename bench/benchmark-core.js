@@ -6,6 +6,7 @@ export const MODEL_DEFAULTS = [
     maxContext: 65_536,
     context: 16_384,
     batchSize: 8,
+    prefillChunk: 256,
     mtp: false,
   },
   {
@@ -15,6 +16,7 @@ export const MODEL_DEFAULTS = [
     maxContext: 131_072,
     context: 8_192,
     batchSize: 4,
+    prefillChunk: 64,
     mtp: false,
   },
   {
@@ -24,6 +26,7 @@ export const MODEL_DEFAULTS = [
     maxContext: 131_072,
     context: 8_192,
     batchSize: 4,
+    prefillChunk: 128,
     mtp: false,
   },
 ];
@@ -60,6 +63,10 @@ export function normalizeConfig(input) {
     models: (input.models ?? []).filter((model) => model.selected !== false).map((model) => {
       const maxContext = integer(model.maxContext, `${model.label} context`, 1_024, model.contextLimit);
       const batchSize = integer(model.batchSize, `${model.label} batch size`, 1, 8);
+      const prefillChunk = integer(model.prefillChunk, `${model.label} prefill chunk`, 32, 256);
+      if (prefillChunk % 32 !== 0) {
+        throw new Error(`${model.label} prefill chunk must be a multiple of 32.`);
+      }
       if (configPromptFloor(input.promptRepeats, input.maxTokens) > maxContext) {
         throw new Error(`${model.label} needs a context above the estimated prompt and output size.`);
       }
@@ -68,6 +75,7 @@ export function normalizeConfig(input) {
         label: model.label,
         maxContext,
         batchSize,
+        prefillChunk,
         mtp: !!model.mtp,
       };
     }),

@@ -36,6 +36,8 @@ export interface LoadOptions {
   model?: ModelId;
   maxContext?: number;
   batchSize?: number;
+  /** Prompt rows processed per GPU submission; rounded to a 32-row tile. */
+  prefillChunk?: number;
   mtp?: boolean;
   reload?: boolean;
 }
@@ -44,6 +46,9 @@ export interface DeviceInfo {
   vendor: string;
   architecture: string;
   vramBytes: number;
+  subgroups?: boolean;
+  subgroupMinSize?: number;
+  subgroupMaxSize?: number;
 }
 
 export interface EngineStatus {
@@ -58,6 +63,8 @@ export interface EngineStatus {
   loaded: boolean;
   generating: boolean;
   hasMtp: boolean;
+  batchSize: number;
+  prefillChunk: number;
   contextUsedTokens: number;
   contextMaxTokens: number;
   device: DeviceInfo | null;
@@ -86,6 +93,17 @@ function resolveLoadOptions(options: LoadOptions, model: ModelId) {
     // is short enough that four tokens amortize the per-batch readback while
     // keeping each burst well under the old two-forward wall-clock.
     batchSize: Math.round(clamp(options.batchSize ?? (gemma ? 4 : 8), 1, 8)),
+    prefillChunk: Math.round(
+      clamp(
+        options.prefillChunk ?? (model === GEMMA_E4B_MODEL_ID
+          ? 64
+          : model === GEMMA_E2B_MODEL_ID
+            ? 128
+            : RT.chunk),
+        32,
+        256
+      ) / 32
+    ) * 32,
     mtp: gemma ? false : options.mtp ?? false,
   };
 }
@@ -253,6 +271,8 @@ export class Engine {
       loaded: this.ready,
       generating: this.generating,
       hasMtp: !!this.modelInstance?.hasMtp,
+      batchSize: this.modelInstance?.BATCH ?? 0,
+      prefillChunk: this.modelInstance?.chunk ?? 0,
       contextUsedTokens: Math.max(0, this.modelInstance?.pos ?? 0),
       contextMaxTokens: this.modelInstance?.maxCtx ?? 0,
       device: this.deviceInfo,
@@ -329,8 +349,15 @@ export class Engine {
 
       onProgress({ stage: "pipelines", message: `Building ${profile.label} pipelines…`, progress: 1 });
       model = isGemmaModelId(target)
-        ? new GemmaModel(gpu, weights as GemmaWeightsMap, { maxCtx: resolved.maxContext, config: gemmaConfig })
-        : new Model(gpu, weights as WeightsMap, { maxCtx: resolved.maxContext });
+        ? new GemmaModel(gpu, weights as GemmaWeightsMap, {
+            maxCtx: resolved.maxContext,
+            chunk: resolved.prefillChunk,
+            config: gemmaConfig,
+          })
+        : new Model(gpu, weights as WeightsMap, {
+            maxCtx: resolved.maxContext,
+            chunk: resolved.prefillChunk,
+          });
       model.BATCH = resolved.batchSize;
       model.spec = !!model.hasMtp && resolved.mtp;
       await model.reset();
@@ -349,6 +376,13 @@ export class Engine {
       vendor: gpu.info?.vendor ?? "unknown",
       architecture: gpu.info?.architecture ?? "",
       vramBytes: vram,
+      subgroups: !!gpu.subgroups,
+      subgroupMinSize: typeof gpu.info?.subgroupMinSize === "number"
+        ? gpu.info.subgroupMinSize
+        : undefined,
+      subgroupMaxSize: typeof gpu.info?.subgroupMaxSize === "number"
+        ? gpu.info.subgroupMaxSize
+        : undefined,
     };
     onProgress({ stage: "ready", message: `${profile.label} ready.`, progress: 1 });
   }

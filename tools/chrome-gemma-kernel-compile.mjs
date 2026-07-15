@@ -30,6 +30,7 @@ const kernelSourceBase64 = Buffer.from(kernelSource).toString("base64");
 const cases = [
   { name: "gemvQ4", modality: "text", args: { N: 2560, K: 2560 } },
   { name: "gemvQ4", label: "e2b-subgroups", modality: "text", args: { N: 1536, K: 1536, SUBGROUPS: 1 } },
+  { name: "gemvQ4", label: "lovelace-direct-subgroup", modality: "text", args: { N: 2560, K: 2560, SUBGROUPS: 1, ROW_LANES: 32, DIRECT_SUBGROUP: 1 } },
   { name: "gemvQ4", label: "e2b-gated", modality: "text", args: { N: 1536, K: 9216, SUBGROUPS: 1, GATED: 1 } },
   { name: "gemmQ4", modality: "text", args: { N: 2560, K: 2560 } },
   { name: "gemmQ4", label: "e2b", modality: "text", args: { N: 12288, K: 1536 } },

@@ -137,6 +137,7 @@ function captureModelPreferences() {
       selected: card.querySelector("[data-role='selected']")?.checked ?? true,
       context: Number(card.querySelector("[data-role='context']")?.value),
       batchSize: Number(card.querySelector("[data-role='batch']")?.value),
+      prefillChunk: Number(card.querySelector("[data-role='prefill-chunk']")?.value),
       mtp: card.querySelector("[data-role='mtp']")?.checked ?? false,
     },
   ]));
@@ -191,6 +192,10 @@ function renderModels(models, preserve = true) {
           <span>Batch</span>
           <select data-role="batch">${batchOptions}</select>
         </label>
+        <label class="model-field">
+          <span>Prefill chunk</span>
+          <input data-role="prefill-chunk" type="number" value="${Number(model.prefillChunk)}" min="32" max="256" step="32">
+        </label>
         ${mtpControl}
       </div>
       <div class="model-status">
@@ -216,6 +221,7 @@ function mergeRemoteModels(remoteModels) {
       ...remote,
       context: current.context ?? fallback.context ?? Math.min(8_192, remote.maxContext),
       batchSize: current.batchSize ?? fallback.batchSize ?? 4,
+      prefillChunk: current.prefillChunk ?? fallback.prefillChunk ?? 64,
       mtp: current.mtp ?? false,
       selected: current.selected ?? true,
     };
@@ -335,6 +341,7 @@ function collectConfig() {
       maxContext: card.querySelector("[data-role='context']").value,
       contextLimit: profile.maxContext,
       batchSize: card.querySelector("[data-role='batch']").value,
+      prefillChunk: card.querySelector("[data-role='prefill-chunk']").value,
       mtp: card.querySelector("[data-role='mtp']")?.checked ?? false,
     };
   });
@@ -417,6 +424,7 @@ function serializeEntry(entry) {
     settings: {
       maxContext: entry.model.maxContext,
       batchSize: entry.model.batchSize,
+      prefillChunk: entry.model.prefillChunk,
       mtp: entry.model.mtp,
     },
     loadSeconds: load?.seconds ?? null,
@@ -572,6 +580,7 @@ async function runBenchmark(event) {
           model: model.id,
           maxContext: model.maxContext,
           batchSize: model.batchSize,
+          prefillChunk: model.prefillChunk,
           mtp: model.mtp,
         });
         const seconds = (performance.now() - start) / 1_000;
