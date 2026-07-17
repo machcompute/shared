@@ -116,6 +116,19 @@ npm run bench
 
 Then open `http://localhost:4173/bench/`. All three registered models are selected by default and run sequentially as load → warmup/benchmark → unload. The page exposes prompt length, output length, warmup, repetitions, context, batch size, prefill chunk size, and Qwen MTP controls, and can copy or download the combined JSON report.
 
+### Native Dawn throughput benchmark
+
+Run the production WebGPU model and loaders directly in Node through Dawn, without launching a browser:
+
+```sh
+npm run test:webgpu
+npm run test:webgpu -- --model gemma-e2b --prompt-tokens 4096 --decode-tokens 256
+```
+
+The first run downloads and quantizes the selected checkpoint. Quantized weights are reused from `~/.cache/mach-compute/webgpu`; override that location with `--cache-dir` or `WEBGPU_CACHE_DIR`. Progress is written to stderr and the final benchmark result is JSON on stdout. Use `npm run test:webgpu -- --probe` to verify the Dawn adapter without loading weights, and `--help` to list all model, context, batch, prefill, backend, and adapter options.
+
+This target measures native model prefill and batched decode throughput. Keep the browser dashboard for end-to-end measurements that include Chrome, OPFS, workers, and the iframe protocol.
+
 For an isolated Gemma/WebGPU test server without disturbing a port-3001 session:
 
 ```sh

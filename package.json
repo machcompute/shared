@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start -p 3001",
     "test": "vitest run",
+    "test:webgpu": "node tools/webgpu-model-throughput.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -22,6 +23,7 @@
     "@types/react-dom": "^19.2.3",
     "@webgpu/types": "^0.1.71",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "webgpu": "^0.4.0"
   }
 }

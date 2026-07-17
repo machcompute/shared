@@ -3,7 +3,9 @@ import {
   GEMM_Q4_TILE_N,
   GEMM_Q4_TILE_T,
   gemvQ4,
+  gemvQ4GateUpI8,
   gemmQ4,
+  rmsnormAddQ,
   textFlashAttention,
 } from "../lib/webgpu-llm/gemma-kernels.js";
 import { gemmaAttentionChunkRange } from "../lib/webgpu-llm/gemma-model.js";
@@ -48,12 +50,48 @@ describe("Gemma decode GEMV subgroup layout", () => {
     expect(source).not.toContain("let subgroupCount");
   });
 
+  it("fuses the residual and quantized pre-FFN norms", () => {
+    const source = rmsnormAddQ({ K: 2560 });
+
+    expect(source).toContain("var<workgroup> ysh: array<f32, 2560>");
+    expect(source).toContain("out[base + i] = y");
+    expect(source).toContain("pack2x16float(vec2f(sc, f32(sum)))");
+  });
+
   it("keeps the portable 64-lane reduction as the default", () => {
     const source = gemvQ4({ N: 2560, K: 2560, SUBGROUPS: 1 });
 
     expect(source).toContain("let row = wid.x * 4u + localRow");
     expect(source).toContain("let subgroupCount");
   });
+
+  it("uses packed int8 activations for DP4a decode projections", () => {
+    const source = gemvQ4({
+      N: 20480,
+      K: 2560,
+      SUBGROUPS: 1,
+      ROW_LANES: 32,
+      DIRECT_SUBGROUP: 1,
+      I8: 1,
+    });
+
+    expect(source).toContain("requires packed_4x8_integer_dot_product");
+    expect(source).toContain("dot4I8Packed");
+    expect(source).toContain("var<storage, read> xsm: array<u32>");
+    expect(source).not.toContain("fn loadX");
+  });
+
+  it("fuses paired gate/up subgroup rows directly into the MLP activation", () => {
+    const source = gemvQ4GateUpI8({ INTERM: 10240, K: 2560 });
+
+    expect(source).toContain("let output = wid.x * 8u + localPair");
+    expect(source).toContain("select(0u, 10240u");
+    expect(source).toContain("subgroupShuffleXor(acc, 8u)");
+    expect(source).toContain("gemma_gelu_tanh(gate) * up");
+    expect(source).not.toContain("array<vec4f>");
+  });
+
+
 });
 
 describe("Gemma active attention chunks", () => {
@@ -61,6 +99,24 @@ describe("Gemma active attention chunks", () => {
     expect(gemmaAttentionChunkRange(0, 64, 512)).toEqual({ base: 0, count: 1 });
     expect(gemmaAttentionChunkRange(4096, 1, 512)).toEqual({ base: 14, count: 3 });
     expect(gemmaAttentionChunkRange(4096, 1, 0)).toEqual({ base: 0, count: 17 });
+    expect(gemmaAttentionChunkRange(4096, 1, 512, 128)).toEqual({ base: 28, count: 5 });
+  });
+
+  it("supports paired-head 128-key decode chunks", () => {
+    const source = textFlashAttention({
+      HEADS: 8,
+      KV_HEADS: 2,
+      HEAD_DIM: 256,
+      MAXCTX: 8192,
+      WINDOW: 512,
+      SUBGROUPS: 1,
+      HEAD_BATCH: 2,
+      CHUNK_SIZE: 128,
+    });
+
+    expect(source).toContain("let chunkBase = chunk * 128u");
+    expect(source).toContain("let valid = lid.x < 128u");
+    expect(source).toContain("var<workgroup> probs: array<vec2f, 256>");
   });
 
   it("offsets dispatched workgroups by the active absolute chunk", () => {
@@ -70,10 +126,15 @@ describe("Gemma active attention chunks", () => {
       HEAD_DIM: 256,
       MAXCTX: 8192,
       WINDOW: 512,
+      SUBGROUPS: 1,
     });
 
     expect(source).toContain("chunkBase: u32");
     expect(source).toContain("let chunk = u.chunkBase + wid.z");
+    expect(source).toContain("fn gemma_kvq_decode4");
+    expect(source).toContain("i32(w << 24u) >> 24u");
+    expect(source).toContain("let sgMax = subgroupMax");
+    expect(source).toContain("let sgSum = subgroupAdd");
   });
 });
 
