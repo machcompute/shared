@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Load the Gemma E4B runtime through the live postMessage API
 // and print bounded progress updates. This exercises the actual browser
-// tokenizer, range-loader, Q4 quantizer, OPFS cache, GPU uploads, and model
-// graph construction.
+// tokenizer, GGUF range validation, verified OPFS cache, native GPU uploads,
+// and model graph construction.
 // Usage: node tools/chrome-gemma-load.mjs [page-url] [cdp-port] [max-context]
 
 const target = process.argv[2] || "http://localhost:3002";

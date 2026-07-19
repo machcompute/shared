@@ -31,9 +31,10 @@ export declare function gemmaAttentionChunkRange(
   basePos: number,
   rows: number,
   window?: number,
+  chunkSize?: number,
 ): { base: number; count: number };
 
-/** Gemma's Q4 text decoder with independent FP8 E4M3FN KV caches. */
+/** Gemma's native-GGUF text decoder with independent FP8 E4M3FN KV caches. */
 export declare class GemmaModel {
   constructor(gpu: GPU, weights: GemmaWeightsMap, opts?: { maxCtx?: number; chunk?: number; config?: GemmaConfig });
   pos: number;

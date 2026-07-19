@@ -1,8 +1,8 @@
 # shared.machcomputing.com
 
-Headless, embeddable WebGPU LLM engine. Qwen3.5-4B is the default Q4 text model; `google/gemma-4-E2B` and `google/gemma-4-E4B` add Q4 text/vision/audio weights, FP8 E4M3FN KV caches, and image/audio/video chat content. It has no UI: the page at `/` is an "API" that other `machcomputing.com` sites embed as a hidden iframe and drive over `postMessage` through the client SDK at `/client.js`.
+Headless, embeddable WebGPU LLM engine. Qwen3.5-4B is the default native-GGUF text model; `google/gemma-4-E2B` and `google/gemma-4-E4B` add native GGUF text/vision/audio weights, FP8 E4M3FN KV caches, and image/audio/video chat content. It has no UI: the page at `/` is an "API" that other `machcomputing.com` sites embed as a hidden iframe and drive over `postMessage` through the client SDK at `/client.js`.
 
-The engine origin owns the weights cache (OPFS, ~3 GB after quantization). Because browsers partition embedded-iframe storage by top-level *site* (eTLD+1), every `*.machcomputing.com` page embedding this engine shares one cache: the model downloads and quantizes once per device, then loads from disk everywhere.
+The engine origin owns the verified GGUF cache in OPFS. Because browsers partition embedded-iframe storage by top-level *site* (eTLD+1), every `*.machcomputing.com` page embedding this engine shares one cache: each pinned GGUF downloads once per device, then its native bytes load from disk everywhere. The cache is committed only after every required file passes its pinned SHA-256.
 
 ## Integration
 
@@ -125,7 +125,7 @@ npm run test:webgpu
 npm run test:webgpu -- --model gemma-e2b --prompt-tokens 4096 --decode-tokens 256
 ```
 
-The first run downloads and quantizes the selected checkpoint. Quantized weights are reused from `~/.cache/mach-compute/webgpu`; override that location with `--cache-dir` or `WEBGPU_CACHE_DIR`. Progress is written to stderr and the final benchmark result is JSON on stdout. Use `npm run test:webgpu -- --probe` to verify the Dawn adapter without loading weights, and `--help` to list all model, context, batch, prefill, backend, and adapter options.
+The first run downloads and verifies the selected GGUF files. Native GGUF bytes are reused from `~/.cache/mach-compute/webgpu`; override that location with `--cache-dir` or `WEBGPU_CACHE_DIR`. Progress is written to stderr and the final benchmark result is JSON on stdout. Use `npm run test:ggml` to compare every accepted packed format against a verification-only scalar reference, `npm run test:webgpu -- --probe` to verify the Dawn adapter without loading weights, and `--help` to list all model, context, batch, prefill, backend, and adapter options.
 
 This target measures native model prefill and batched decode throughput. Keep the browser dashboard for end-to-end measurements that include Chrome, OPFS, workers, and the iframe protocol.
 
@@ -135,7 +135,7 @@ For an isolated Gemma/WebGPU test server without disturbing a port-3001 session:
 NEXT_DIST_DIR=.next-gemma-test ./node_modules/.bin/next dev -p 3002
 ```
 
-Launch Chrome with Vulkan and Unsafe WebGPU enabled when your Linux setup needs those flags. The Gemma checkpoint is large (~16 GB source, roughly 5 GB Q4 browser cache before the FP8 KV cache), so test only on a GPU with sufficient headroom.
+Launch Chrome with Vulkan and Unsafe WebGPU enabled when your Linux setup needs those flags. Gemma E4B stores about 5.58 GB of base and multimodal GGUF data before runtime buffers, so test only on a GPU with sufficient headroom.
 
 - Consumer apps set their engine URL to `http://localhost:3001` in development (e.g. `NEXT_PUBLIC_LLM_ENGINE_URL`) and omit it in production.
 - All `localhost` ports share one top-level site, so every local app reuses the same dev cache; it is separate from the production cache.

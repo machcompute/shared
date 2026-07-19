@@ -114,19 +114,23 @@ type RuntimeTokenizer = Tokenizer | GemmaTokenizer;
 
 type BufferLike = { size: number };
 type WeightLike = {
-  q?: BufferLike;
-  s?: BufferLike;
+  buffer?: BufferLike;
   size?: number;
-  shards?: Array<{ q: BufferLike; s: BufferLike }>;
+  byteLength?: number;
+  shards?: Array<{ buffer: BufferLike }>;
+  segments?: Array<{ buffer: BufferLike }>;
 };
 
 function weightsVramBytes(weights: Record<string, unknown>): number {
+  if (typeof weights.__nativeBytes === "number") return weights.__nativeBytes;
   let total = 0;
   for (const entry of Object.values(weights) as WeightLike[]) {
     if (!entry) continue;
-    if (entry.q && entry.s) total += entry.q.size + entry.s.size;
+    if (entry.buffer) total += entry.buffer.size;
     else if (entry.shards) {
-      for (const shard of entry.shards) total += shard.q.size + shard.s.size;
+      for (const shard of entry.shards) total += shard.buffer.size;
+    } else if (entry.segments) {
+      for (const segment of entry.segments) total += segment.buffer.size;
     } else if (entry.size) total += entry.size;
   }
   return total;

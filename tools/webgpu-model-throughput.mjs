@@ -6,15 +6,13 @@
 import { access, copyFile, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { Worker as NodeWorker } from "node:worker_threads";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { create, globals } from "webgpu";
 
-const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const QUANT_WORKER = path.join(ROOT, "public/webgpu-llm/quant-worker.js");
-const DEFAULT_CACHE_DIR = path.join(homedir(), ".cache", "mach-compute", "webgpu");
+export const ROOT = fileURLToPath(new URL("..", import.meta.url));
+export const DEFAULT_CACHE_DIR = path.join(homedir(), ".cache", "mach-compute", "webgpu");
 
-const MODEL_SPECS = {
+export const MODEL_SPECS = {
   qwen: {
     id: "Qwen/Qwen3.5-4B",
     label: "Qwen 3.5 4B",
@@ -62,13 +60,14 @@ Runs real model prefill and batched decode through native Dawn/WebGPU.
 Options:
   --model <name>          qwen (default), gemma-e2b, or gemma-e4b
   --prompt-tokens <n>     Synthetic prompt length (default: 1024)
+  --prompt-ids <csv>      Exact token IDs instead of a synthetic prompt
   --decode-tokens <n>     Timed generated tokens per run (default: 128)
   --warmup-tokens <n>     Untimed decode warmup tokens (default: 8)
   --runs <n>              Timed runs (default: 3)
   --context <n>           Context capacity (default: enough for this run, min 1024)
   --batch-size <n>        Decode batch size (default: 8)
   --prefill-chunk <n>     Prompt chunk, a multiple of 32 from 32 to 256
-  --cache-dir <path>      Persistent quantized-weight cache
+  --cache-dir <path>      Persistent verified GGUF cache
                           (default: ${DEFAULT_CACHE_DIR})
   --backend <name>        Dawn backend, e.g. vulkan, metal, or d3d12
   --adapter <name>        Dawn adapter name filter
@@ -117,7 +116,13 @@ function resolveOptions(raw) {
   const modelName = MODEL_ALIASES.get(requestedModel);
   if (!modelName) throw new Error(`Unknown model: ${requestedModel}`);
   const model = MODEL_SPECS[modelName];
-  const promptTokens = integer(envOr(raw, "prompt-tokens", "WEBGPU_PROMPT_TOKENS", 1024), "prompt tokens", 1, model.maxContext - 2);
+  const promptIds = raw["prompt-ids"] === undefined ? null : String(raw["prompt-ids"]).split(",").map((value) => {
+    const id = Number(value.trim());
+    if (!Number.isInteger(id) || id < 0) throw new Error(`Invalid prompt token ID: ${value}`);
+    return id;
+  });
+  if (promptIds && promptIds.length === 0) throw new Error("prompt IDs must not be empty");
+  const promptTokens = promptIds?.length ?? integer(envOr(raw, "prompt-tokens", "WEBGPU_PROMPT_TOKENS", 1024), "prompt tokens", 1, model.maxContext - 2);
   const decodeTokens = integer(envOr(raw, "decode-tokens", "WEBGPU_DECODE_TOKENS", 128), "decode tokens", 1, 4096);
   const warmupTokens = integer(envOr(raw, "warmup-tokens", "WEBGPU_WARMUP_TOKENS", 8), "warmup tokens", 0, 256);
   const runs = integer(envOr(raw, "runs", "WEBGPU_RUNS", 3), "runs", 1, 10);
@@ -131,6 +136,7 @@ function resolveOptions(raw) {
     modelName,
     model,
     promptTokens,
+    promptIds,
     decodeTokens,
     warmupTokens,
     runs,
@@ -349,42 +355,10 @@ class NodeDirectoryHandle {
   }
 }
 
-const WORKER_BOOTSTRAP = String.raw`
-const { parentPort, workerData } = require("node:worker_threads");
-const { readFileSync } = require("node:fs");
-const vm = require("node:vm");
-globalThis.postMessage = (data, transfer) => parentPort.postMessage(data, transfer);
-vm.runInThisContext(readFileSync(workerData.script, "utf8"), { filename: workerData.script });
-parentPort.on("message", (data) => globalThis.onmessage({ data }));
-`;
-
-class BrowserWorker {
-  constructor(specifier) {
-    const filename = specifier === "/webgpu-llm/quant-worker.js"
-      ? QUANT_WORKER
-      : specifier instanceof URL && specifier.protocol === "file:"
-        ? fileURLToPath(specifier)
-        : null;
-    if (!filename) throw new Error(`Unsupported worker URL in native benchmark: ${String(specifier)}`);
-    this.worker = new NodeWorker(WORKER_BOOTSTRAP, { eval: true, workerData: { script: filename } });
-    this.worker.on("message", (data) => this.onmessage?.({ data }));
-    this.worker.on("error", (error) => this.onerror?.({ message: error.message, error }));
-  }
-
-  postMessage(data, transfer) {
-    this.worker.postMessage(data, transfer);
-  }
-
-  terminate() {
-    return this.worker.terminate();
-  }
-}
-
-function installNodePlatform(cacheDir) {
+export function installNodePlatform(cacheDir) {
   const navigatorObject = globalThis.navigator ?? {};
   if (!globalThis.navigator) Object.defineProperty(globalThis, "navigator", { value: navigatorObject, configurable: true });
   const storageDescriptor = Object.getOwnPropertyDescriptor(navigatorObject, "storage");
-  const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
   const root = new NodeDirectoryHandle(cacheDir);
   Object.defineProperty(navigatorObject, "storage", {
     configurable: true,
@@ -396,13 +370,9 @@ function installNodePlatform(cacheDir) {
       },
     },
   });
-  Object.defineProperty(globalThis, "Worker", { configurable: true, writable: true, value: BrowserWorker });
-
   return () => {
     if (storageDescriptor) Object.defineProperty(navigatorObject, "storage", storageDescriptor);
     else delete navigatorObject.storage;
-    if (workerDescriptor) Object.defineProperty(globalThis, "Worker", workerDescriptor);
-    else delete globalThis.Worker;
   };
 }
 
@@ -413,7 +383,7 @@ function dawnOptions(options) {
   return out;
 }
 
-function installNativeWebGPU(options) {
+export function installNativeWebGPU(options) {
   Object.assign(globalThis, globals);
   const navigatorObject = globalThis.navigator ?? {};
   if (!globalThis.navigator) Object.defineProperty(globalThis, "navigator", { value: navigatorObject, configurable: true });
@@ -445,20 +415,7 @@ async function probeNodePlatform() {
     await root.removeEntry(dirname, { recursive: true }).catch(() => {});
   }
 
-  const worker = new Worker("/webgpu-llm/quant-worker.js");
-  try {
-    const result = await new Promise((resolve, reject) => {
-      worker.onmessage = ({ data }) => resolve(data);
-      worker.onerror = ({ error, message }) => reject(error ?? new Error(message));
-      worker.postMessage({ id: 1, u16: new Uint16Array(32).buffer, rows: 1, K: 32 });
-    });
-    if (result.id !== 1 || result.qdata.byteLength !== 16 || result.scales.byteLength !== 4) {
-      throw new Error("Quantization worker bridge returned an invalid layout");
-    }
-  } finally {
-    await worker.terminate();
-  }
-  return { filesystemCache: true, quantizationWorker: true };
+  return { filesystemCache: true, nativeGGUF: true };
 }
 
 function selectedLimits(limits) {
@@ -480,10 +437,11 @@ function median(values) {
 function greedyCandidate(candidates) {
   if (!candidates?.ids?.length || !candidates?.vals?.length) throw new Error("Model returned no next-token candidates");
   let best = 0;
-  for (let i = 1; i < candidates.ids.length; i++) {
-    if (candidates.vals[i] > candidates.vals[best]) best = i;
+  const count = candidates.ids.length / 2;
+  for (let i = 1; i < count; i++) {
+    if (candidates.vals[i * 2 + 1] > candidates.vals[best * 2 + 1]) best = i;
   }
-  return Number(candidates.ids[best]);
+  return Number(candidates.ids[best * 2]);
 }
 
 const sampling = {
@@ -499,15 +457,17 @@ async function runDecode(model, firstToken, tokens, batchSize) {
   let next = firstToken;
   let produced = 0;
   let submissions = 0;
+  const ids = [];
   while (produced < tokens) {
     const count = Math.min(batchSize, tokens - produced);
     const result = await model.decodeBatch(next, count, sampling);
     if (!result.ids.length) throw new Error("Decode batch produced no tokens");
     produced += result.ids.length;
+    ids.push(...result.ids.map(Number));
     submissions++;
     next = result.ids[result.ids.length - 1];
   }
-  return { produced, submissions, next };
+  return { produced, submissions, next, ids };
 }
 
 async function benchmarkRun(model, options, prompt) {
@@ -531,10 +491,11 @@ async function benchmarkRun(model, options, prompt) {
     tokensPerSecond: decode.produced / decodeSeconds,
     millisecondsPerToken: decodeSeconds * 1000 / decode.produced,
     totalSeconds: (end - prefillStart) / 1000,
+    generatedTokenIds: [firstToken, ...decode.ids],
   };
 }
 
-function makeProgressReporter() {
+export function makeProgressReporter() {
   let lastAt = 0;
   let lastStage = null;
   let lastBucket = -1;
@@ -550,7 +511,7 @@ function makeProgressReporter() {
   };
 }
 
-async function loadRuntime(gpu, options, report) {
+export async function loadRuntime(gpu, options, report) {
   if (options.model.kind === "qwen") {
     const [{ Loader }, { Model }] = await Promise.all([
       import(pathToFileURL(path.join(ROOT, "lib/webgpu-llm/loader.js"))),
@@ -615,7 +576,7 @@ async function main() {
     const loadStart = performance.now();
     const model = await loadRuntime(gpu, options, makeProgressReporter());
     const loadSeconds = (performance.now() - loadStart) / 1000;
-    const prompt = new Array(options.promptTokens).fill(options.model.promptToken);
+    const prompt = options.promptIds ?? new Array(options.promptTokens).fill(options.model.promptToken);
 
     if (options.warmupTokens) {
       process.stderr.write(`Warming up ${options.warmupTokens} decode tokens...\n`);
@@ -666,7 +627,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error?.stack ?? error}\n`);
-  process.exitCode = 1;
-});
+const invokedAsScript = process.argv[1]
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+if (invokedAsScript) {
+  main().catch((error) => {
+    process.stderr.write(`${error?.stack ?? error}\n`);
+    process.exitCode = 1;
+  });
+}

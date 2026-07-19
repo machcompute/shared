@@ -28,18 +28,8 @@ const kernelSourceBase64 = Buffer.from(kernelSource).toString("base64");
 // A few generators are intentionally represented more than once where E4B has
 // materially different compiled paths (local versus global text attention).
 const cases = [
-  { name: "gemvQ4", modality: "text", args: { N: 2560, K: 2560 } },
-  { name: "gemvQ4", label: "e2b-subgroups", modality: "text", args: { N: 1536, K: 1536, SUBGROUPS: 1 } },
-  { name: "gemvQ4", label: "lovelace-direct-subgroup", modality: "text", args: { N: 2560, K: 2560, SUBGROUPS: 1, ROW_LANES: 32, DIRECT_SUBGROUP: 1 } },
-  { name: "gemvQ4", label: "lovelace-dp4a", modality: "text", args: { N: 20480, K: 2560, SUBGROUPS: 1, ROW_LANES: 32, DIRECT_SUBGROUP: 1, I8: 1 } },
-  { name: "gemvQ4GateUpI8", modality: "text", args: { INTERM: 10240, K: 2560 } },
-  { name: "gemvQ4", label: "e2b-gated", modality: "text", args: { N: 1536, K: 9216, SUBGROUPS: 1, GATED: 1 } },
-  { name: "gemmQ4", modality: "text", args: { N: 2560, K: 2560 } },
-  { name: "gemmQ4", label: "e2b", modality: "text", args: { N: 12288, K: 1536 } },
-  { name: "gatherQ4", modality: "text", args: { START: 0, NUM: 256, K: 2560, SCALE: Math.sqrt(2560) } },
   { name: "rmsnorm", modality: "text", args: { K: 2560 } },
   { name: "rmsnormAdd", modality: "text", args: { K: 2560 } },
-  { name: "rmsnormAddQ", modality: "text", args: { K: 2560 } },
   { name: "rmsnormAddScale", label: "e2b", modality: "text", args: { K: 1536 } },
   { name: "layernorm", modality: "audio", args: { K: 1024 } },
   { name: "clearF32", modality: "shared", args: null },
@@ -142,7 +132,6 @@ const cases = [
   { name: "headRmsnorm", modality: "vision", args: { HEADS: 12, HEAD_DIM: 64 } },
   { name: "vision2DRope", modality: "vision", args: { HEADS: 12, HEAD_DIM: 64, THETA: 100 } },
   { name: "addVisionPositions", modality: "vision", args: { H: 768, TABLE_SIZE: 10240 } },
-  { name: "addVisionPositionsQ4", modality: "vision", args: { H: 768, TABLE_SIZE: 10240 } },
   { name: "clampByScalars", modality: "shared", args: null },
   { name: "clampByBounds", label: "input", modality: "shared", args: { OFFSET: 0 } },
   { name: "clampByBounds", label: "output", modality: "shared", args: { OFFSET: 2 } },

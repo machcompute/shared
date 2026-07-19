@@ -1099,7 +1099,7 @@ function makePatchPositions(layout: VisionLayout): Int32Array {
   return positions;
 }
 
-function patchifyRgba(
+export function patchifyRgba(
   rgba: Uint8ClampedArray,
   layout: VisionLayout,
   output: Float32Array,
@@ -1112,14 +1112,17 @@ function patchifyRgba(
   let patch = 0;
   for (let patchY = 0; patchY < layout.patchHeight; patchY++) {
     for (let patchX = 0; patchX < layout.patchWidth; patchX++, patch++) {
-      let destination = outputOffset + patch * GEMMA_IMAGE_PATCH_PIXELS;
-      for (let y = 0; y < GEMMA_IMAGE_PATCH_SIZE; y++) {
-        let source = ((patchY * GEMMA_IMAGE_PATCH_SIZE + y) * layout.width + patchX * GEMMA_IMAGE_PATCH_SIZE) * 4;
-        for (let x = 0; x < GEMMA_IMAGE_PATCH_SIZE; x++) {
-          output[destination++] = rgba[source++] / 255;
-          output[destination++] = rgba[source++] / 255;
-          output[destination++] = rgba[source++] / 255;
-          source++; // Skip alpha: Gemma's processor converts the input to RGB.
+      // llama.cpp's GGUF converter stores the patch projection in CHW order.
+      // Match it here so the native matrix can be consumed without a loader-
+      // side permutation or duplicate transformed cache.
+      const destination = outputOffset + patch * GEMMA_IMAGE_PATCH_PIXELS;
+      for (let channel = 0; channel < 3; channel++) {
+        for (let y = 0; y < GEMMA_IMAGE_PATCH_SIZE; y++) {
+          let source = ((patchY * GEMMA_IMAGE_PATCH_SIZE + y) * layout.width + patchX * GEMMA_IMAGE_PATCH_SIZE) * 4;
+          for (let x = 0; x < GEMMA_IMAGE_PATCH_SIZE; x++) {
+            output[destination + channel * GEMMA_IMAGE_PATCH_SIZE ** 2 + y * GEMMA_IMAGE_PATCH_SIZE + x] = rgba[source + channel] / 255;
+            source += 4;
+          }
         }
       }
     }

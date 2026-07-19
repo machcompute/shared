@@ -1,0 +1,23 @@
+{
+  "llamaCppCommit": "86d86ed",
+  "cases": [
+    {
+      "model": "qwen",
+      "promptText": "Hello",
+      "promptTokenIds": [9419],
+      "generatedTokenIds": [11, 353, 2688, 4313, 310, 1791, 264, 4145]
+    },
+    {
+      "model": "gemma-e2b",
+      "promptText": "Hello",
+      "promptTokenIds": [2, 9259],
+      "generatedTokenIds": [236888, 2088, 740, 564, 1601, 611, 3124, 236881]
+    },
+    {
+      "model": "gemma-e4b",
+      "promptText": "Hello",
+      "promptTokenIds": [2, 9259],
+      "generatedTokenIds": [236888, 564, 236789, 236757, 9775, 531, 11184, 607]
+    }
+  ]
+}

@@ -1,22 +1,42 @@
 import type { GPU } from "./gpu.js";
 
 export interface WeightEntry {
-  q?: GPUBuffer;
-  s?: GPUBuffer;
-  size?: number;
-  N?: number;
-  K?: number;
+  buffer?: GPUBuffer;
+  dimensions?: number[];
+  N: number;
+  K: number;
+  type: number;
+  typeName: string;
+  blockSize: number;
+  typeSize: number;
+  rowStride: number;
+  byteLength: number;
+  start?: number;
+  rows?: number;
+  outOffset?: number;
+  shards?: WeightEntry[];
+  segments?: WeightEntry[];
 }
 
 export interface CacheManifest {
-  version: number;
+  schema: number;
+  namespace: string;
   complete: boolean;
-  entries: unknown[];
+  files: Array<{
+    filename: string;
+    revision: string;
+    byteLength: number;
+    sha256: string;
+    dataOffset: number;
+  }>;
 }
 
 export type WeightsMap = Record<string, WeightEntry> & {
-  embShards?: Array<{ start: number; rows: number; q: GPUBuffer; s: GPUBuffer }>;
+  embShards?: WeightEntry[];
+  __nativeBytes?: number;
 };
+
+export declare function buildQwenGGUFMap(): ReadonlyArray<unknown>;
 
 export declare class Loader {
   constructor(gpu: GPU | null, status: (msg: string, phase?: string, frac?: number | null) => void);

@@ -5,8 +5,8 @@
 
 const target = process.argv[2] || "http://localhost:3002";
 const port = Number(process.argv[3] || 9223);
-const revision = "58c4d7b5cbe175834bd5cde6fcdbe0cfcf739377";
-const checkpoint = `https://huggingface.co/google/gemma-4-E4B/resolve/${revision}/model.safetensors`;
+const revision = "06f24bb269339b2a19a5167199b81e89ef813c10";
+const checkpoint = `https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/${revision}/gemma-4-E4B-it-Q4_0.gguf`;
 
 const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
 const page = pages.find((entry) => entry.type === "page");
